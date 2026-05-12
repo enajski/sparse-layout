@@ -1,0 +1,4 @@
+{:paths ["src"]
+ :aliases
+ {:test {:extra-paths ["test"]
+         :main-opts ["-e" "(do (require 'clojure.test 'sparse-layout.core-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.core-test)] (when (pos? (+ fail error)) (System/exit 1))))"]}}}
