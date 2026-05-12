@@ -1,7 +1,7 @@
 (ns sparse-layout.core-test
   (:require [clojure.test :refer [deftest is testing]]
             [sparse-layout.core :as sparse]
-            [sparse-layout.core :refer [block col-blocks col-id defsparse row-blocks row-id]]))
+            [sparse-layout.core :refer [block block-view col-blocks col-block-views col-id defsparse row-blocks row-block-views row-id]]))
 
 (def ^Class double-array-type
   (Class/forName "[D"))
@@ -14,6 +14,14 @@
 (defn- materialize-blocks [blocks]
   (mapv (fn [[key value]]
           [key (materialize-value value)])
+        blocks))
+
+(defn- materialize-view [view]
+  (sparse/block-view->vec view))
+
+(defn- materialize-view-blocks [blocks]
+  (mapv (fn [[key view]]
+          [key (materialize-view view)])
         blocks))
 
 (defsparse entity-features
@@ -125,6 +133,51 @@
     (is (= [[1 [1.0 2.0]]
             [2 [4.0 5.0 6.0]]]
            (materialize-blocks (variable-features-col ds :xs))))))
+
+(deftest exposes-zero-copy-block-views
+  (let [ds (entity-features-compile
+            [{:entity 1
+              :vals (array-map :f1 [1.0 2.0 3.0]
+                               :f2 [4.0 5.0 6.0])}
+             {:entity 2
+              :vals (array-map :f2 [7.0 8.0 9.0])}])
+        view (entity-features-block-view ds 1 :f2)]
+    (is (= [4.0 5.0 6.0] (materialize-view view)))
+    (is (= 3 (sparse/block-view-length view)))
+    (is (= 4.0 (sparse/block-view-value view 0)))
+    (is (= [[:f1 [1.0 2.0 3.0]]
+            [:f2 [4.0 5.0 6.0]]]
+           (materialize-view-blocks (entity-features-row-views ds 1))))
+    (is (= [[1 [4.0 5.0 6.0]]
+            [2 [7.0 8.0 9.0]]]
+           (materialize-view-blocks (entity-features-col-views ds :f2))))
+    (is (= [7.0 8.0 9.0]
+           (materialize-view (block-view ds 2 :f2))))
+    (is (= [[:f1 [1.0 2.0 3.0]]
+            [:f2 [4.0 5.0 6.0]]]
+           (materialize-view-blocks (row-block-views ds 1))))
+    (is (= [[1 [4.0 5.0 6.0]]
+            [2 [7.0 8.0 9.0]]]
+           (materialize-view-blocks (col-block-views ds :f2))))))
+
+(deftest exposes-zero-copy-variable-block-views
+  (let [ds (variable-features-compile
+            [{:entity 1 :vals (array-map :xs [1.0 2.0]
+                                         :ys [3.0])}
+             {:entity 2 :vals (array-map :xs (double-array [4.0 5.0 6.0]))}])
+        view (variable-features-block-view ds 2 :xs)]
+    (is (= [4.0 5.0 6.0] (materialize-view view)))
+    (is (= [[1 [1.0 2.0]]
+            [2 [4.0 5.0 6.0]]]
+           (materialize-view-blocks (variable-features-col-views ds :xs))))))
+
+(deftest scalar-layout-rejects-zero-copy-block-views
+  (let [ds (scalar-features-compile
+            [{:entity :a :vals (array-map :x 1.25)}])]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"Zero-copy block views require block payload storage"
+         (scalar-features-block-view ds :a :x)))))
 
 (deftest retain-coo-is-configurable-at-freeze-time
   (let [rows [{:entity 1 :vals (array-map :f1 [1.0 2.0 3.0]

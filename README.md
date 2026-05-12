@@ -48,6 +48,9 @@ For `(defsparse entity-features ...)`, the macro emits:
 - `entity-features-row`
 - `entity-features-col`
 - `entity-features-block`
+- `entity-features-row-views`
+- `entity-features-col-views`
+- `entity-features-block-view`
 
 All frozen types also implement the shared `sparse-layout.core/SparseDataset` protocol:
 
@@ -58,6 +61,31 @@ All frozen types also implement the shared `sparse-layout.core/SparseDataset` pr
 (col-blocks ds :f2)
 (block ds 1 :f2)
 ```
+
+Block payload layouts also implement the shared `sparse-layout.core/SparseBlockViews` protocol:
+
+```clojure
+(row-block-views ds 1)
+(col-block-views ds :f2)
+(block-view ds 1 :f2)
+```
+
+`block-view` returns a `DoubleBlockView` that points at the frozen `double[]` payload storage without allocating a fresh block array. Use:
+
+```clojure
+(sparse-layout.core/block-view-array view)
+(sparse-layout.core/block-view-offset view)
+(sparse-layout.core/block-view-length view)
+(sparse-layout.core/block-view-value view 0)
+(sparse-layout.core/block-view->vec view)
+```
+
+Zero-copy views are supported for:
+
+- `{:kind :fixed-double-block :dim n}`
+- `{:kind :var-double-block}`
+
+Scalar and object payload layouts continue to use the existing copying `block` API.
 
 ## Storage Model
 
