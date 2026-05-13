@@ -87,6 +87,46 @@ Zero-copy views are supported for:
 
 Scalar and object payload layouts continue to use the existing copying `block` API.
 
+## Persistent-Style Facades
+
+The optional `sparse-layout.facade` namespace provides read-only Clojure collection ergonomics over frozen datasets:
+
+```clojure
+(require '[sparse-layout.facade :as facade])
+
+(def m (facade/as-map ds))
+
+(get m 1)
+;; => row map facade
+
+(vec (seq (get-in m [1 :f2])))
+;; => [4.0 5.0 6.0]
+
+(contains? m 1)
+(contains? (get m 1) :f1)
+(find m 1)
+(count m)
+(count (get m 1))
+(reduce-kv (fn [acc row-key row] acc) nil m)
+```
+
+Facades are deliberately read-only. `assoc` is not supported on frozen sparse datasets; use a builder and re-freeze when data needs to change.
+
+Column-oriented facades are available when a CSC index was compiled:
+
+```clojure
+(def c (facade/col-map ds :f2))
+(get c 2)
+(seq c)
+```
+
+For zero-copy block traversal, use view facades:
+
+```clojure
+(def vm (facade/as-view-map ds))
+(sparse-layout.core/block-view-value (get-in vm [1 :f2]) 0)
+```
+
 ## Storage Model
 
 Ingest uses mutable COO buffers:

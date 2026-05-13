@@ -14,6 +14,9 @@
   (col-block-views [this col-key])
   (block-view [this row-key col-key]))
 
+(defprotocol SparseInternals
+  (sparse-internals [this]))
+
 (def ^:private allowed-payload-kinds
   #{:double :long :object :fixed-double-block :var-double-block})
 
@@ -722,6 +725,24 @@
               (< edge-row row-id) (recur (inc mid) hi)
               :else (recur lo (dec mid)))))))))
 
+(defn payload-id-by-ids
+  [row-id
+   col-id
+   csr-row-ptrs
+   csr-col-ids
+   csc-col-ptrs
+   csc-row-ids
+   csc-payload-ids]
+  (if (and (<= 0 row-id) (<= 0 col-id))
+    (do
+      (when (and (nil? csr-row-ptrs) (nil? csc-col-ptrs))
+        (throw (ex "Neither CSR nor CSC index was compiled."
+                   {:required #{:csr :csc}})))
+      (if (some? csr-row-ptrs)
+        (find-payload-in-csr csr-col-ids csr-row-ptrs row-id col-id)
+        (find-payload-in-csc csc-row-ids csc-col-ptrs csc-payload-ids row-id col-id)))
+    -1))
+
 (defn payload-value [payload-kind payload-dim payload-values payload-ptrs payload-id]
   (case payload-kind
     :double
@@ -827,12 +848,13 @@
    payload-values
    payload-ptrs]
   (when (and (<= 0 row-id) (<= 0 col-id))
-    (when (and (nil? csr-row-ptrs) (nil? csc-col-ptrs))
-      (throw (ex "Neither CSR nor CSC index was compiled."
-                 {:required #{:csr :csc}})))
-    (let [payload-id (if (some? csr-row-ptrs)
-                       (find-payload-in-csr csr-col-ids csr-row-ptrs row-id col-id)
-                       (find-payload-in-csc csc-row-ids csc-col-ptrs csc-payload-ids row-id col-id))]
+    (let [payload-id (payload-id-by-ids row-id
+                                        col-id
+                                        csr-row-ptrs
+                                        csr-col-ids
+                                        csc-col-ptrs
+                                        csc-row-ids
+                                        csc-payload-ids)]
       (when-not (= -1 payload-id)
         (payload-value payload-kind payload-dim payload-values payload-ptrs payload-id)))))
 
@@ -849,12 +871,13 @@
    payload-values
    payload-ptrs]
   (when (and (<= 0 row-id) (<= 0 col-id))
-    (when (and (nil? csr-row-ptrs) (nil? csc-col-ptrs))
-      (throw (ex "Neither CSR nor CSC index was compiled."
-                 {:required #{:csr :csc}})))
-    (let [payload-id (if (some? csr-row-ptrs)
-                       (find-payload-in-csr csr-col-ids csr-row-ptrs row-id col-id)
-                       (find-payload-in-csc csc-row-ids csc-col-ptrs csc-payload-ids row-id col-id))]
+    (let [payload-id (payload-id-by-ids row-id
+                                        col-id
+                                        csr-row-ptrs
+                                        csr-col-ids
+                                        csc-col-ptrs
+                                        csc-row-ids
+                                        csc-payload-ids)]
       (when-not (= -1 payload-id)
         (payload-view payload-kind payload-dim payload-values payload-ptrs payload-id)))))
 
@@ -1157,6 +1180,23 @@
                                                    ~'payloadDim
                                                    ~'payloadValues
                                                    ~'payloadPtrs)))
+         sparse-layout.core/SparseInternals
+         (~'sparse-internals [~'this]
+           {:row->id ~'rowToId
+            :id->row ~'idToRow
+            :col->id ~'colToId
+            :id->col ~'idToCol
+            :edge-rows ~'edgeRows
+            :edge-cols ~'edgeCols
+            :csr-row-ptrs ~'csrRowPtrs
+            :csr-col-ids ~'csrColIds
+            :csc-col-ptrs ~'cscColPtrs
+            :csc-row-ids ~'cscRowIds
+            :csc-payload-ids ~'cscPayloadIds
+            :payload-kind ~'payloadKind
+            :payload-dim ~'payloadDim
+            :payload-values ~'payloadValues
+            :payload-ptrs ~'payloadPtrs})
          ~marker-protocol-name
          (~marker-method-name [~'this] true)
          Object

@@ -1,3 +1,7 @@
 .cpcache/
 .gitprobe
 .git-test/
+.calva/
+.clj-kondo/.cache
+.lsp/
+.nrepl-port
