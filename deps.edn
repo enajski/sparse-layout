@@ -1,4 +1,14 @@
 {:paths ["src"]
  :aliases
  {:test {:extra-paths ["test"]
-         :main-opts ["-e" "(do (require 'clojure.test 'sparse-layout.core-test 'sparse-layout.facade-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.core-test 'sparse-layout.facade-test)] (when (pos? (+ fail error)) (System/exit 1))))"]}}}
+         :main-opts ["-e" "(do (require 'clojure.test 'sparse-layout.core-test 'sparse-layout.facade-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.core-test 'sparse-layout.facade-test)] (when (pos? (+ fail error)) (System/exit 1))))"]}
+  :bench {:extra-paths ["bench"]
+          :extra-deps {criterium/criterium {:mvn/version "0.5.243-ALPHA"}}
+          :jvm-opts ["-XX:+UnlockExperimentalVMOptions"
+                     "-XX:CompileCommand=blackhole,criterium.blackhole.Blackhole::consume"]
+          :main-opts ["-m" "sparse-layout.bench"]}
+  :memory {:extra-paths ["bench"]
+           :extra-deps {com.clojure-goes-fast/clj-memory-meter {:mvn/version "0.4.0"}}
+           :jvm-opts ["-XX:+EnableDynamicAgentLoading"
+                      "-Djdk.attach.allowAttachSelf=true"]
+           :main-opts ["-m" "sparse-layout.memory"]}}}

@@ -5,3 +5,6 @@
 .clj-kondo/.cache
 .lsp/
 .nrepl-port
+.clj-kondo/imports/
+/.bridge/ephemeral/
+/docs/wiki

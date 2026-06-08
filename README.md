@@ -32,6 +32,43 @@ A small Clojure sparse layout compiler prototype.
 ;; => [[1 #double [...]] [2 #double [...]]]
 ```
 
+## What This Is For
+
+Use `sparse-layout` when the logical data model looks like a nested map:
+
+```clojure
+{row-key {col-key payload}}
+```
+
+but most row/column combinations are absent and hot paths need less allocation than ordinary persistent maps can provide. Typical examples include:
+
+- sparse feature stores keyed by entity and feature name
+- recommendation or scoring matrices keyed by user/item, entity/attribute, or document/token
+- graph adjacency where rows represent source nodes and columns represent destination nodes
+- event, metric, or observation tables where each entity has only a small subset of possible datapoints
+- fixed-width numerical feature blocks where returning a zero-copy view is cheaper than allocating vectors
+
+The library keeps the input shape declarative while compiling the frozen representation into primitive arrays and dictionaries. You ingest from nested Clojure records, then query by row, by column, or by point coordinate depending on which indexes were compiled.
+
+## COO, CSR, and CSC
+
+`sparse-layout` uses three sparse-matrix layouts for different phases and access patterns.
+
+**COO, coordinate list**, is the ingest format. Each appended value is stored as a `(row-id, col-id, payload)` edge. COO is simple and append-friendly, which makes it a good fit while walking arbitrary nested Clojure data and dictionary-encoding row and column keys. It is not the final query format: freeze sorts COO edges, coalesces duplicates, compacts payload storage, and builds compressed indexes.
+
+**CSR, compressed sparse row**, is the row index. It stores one pointer range per row plus the column ids and payloads for that row. CSR is the default because many sparse workloads are row-oriented: "give me all features for entity E", "walk outgoing graph edges", "score one example", or "read this row and one column inside it." Point lookups can use CSR by binary-searching within a row.
+
+**CSC, compressed sparse column**, is the column index. It stores one pointer range per column plus row ids and payload ids. Compile CSC when reverse lookups are hot: "find all entities with feature F", "walk incoming graph edges", "aggregate one metric across entities", or "read all rows that have column C." CSC costs extra arrays at freeze time, so omit it when the workload never traverses columns.
+
+Index choices are part of the layout:
+
+```clojure
+{:indices #{:csr}}       ;; row traversal and point lookup
+{:indices #{:csr :csc}}  ;; row traversal, column traversal, and point lookup
+```
+
+By default, frozen datasets also retain the sorted COO coordinate arrays. Set `:retain-coo? false` when CSR/CSC are enough and the extra coordinate arrays are not needed.
+
 ## Generated API
 
 For `(defsparse entity-features ...)`, the macro emits:
@@ -129,7 +166,7 @@ For zero-copy block traversal, use view facades:
 
 ## Storage Model
 
-Ingest uses mutable COO buffers:
+Ingest starts with mutable COO buffers:
 
 - row and column ids are dictionary-encoded with `java.util.HashMap`
 - row ids and column ids are appended to growable primitive `int[]` buffers
@@ -192,8 +229,82 @@ Set `:duplicate-policy` in a layout:
 - `:merge`, requires `:merge-fn`
 - `:error`
 
+## Verification
+
+This project uses `bridge` to maintain verification-aware alignment between code, specs, tests, and evidence.
+
+To analyze changes and check obligations:
+
+```sh
+bb bridge next
+```
+
 `deps.edn` includes a test alias:
 
 ```sh
 clojure -M:test
+```
+
+Use `bb bridge run-evidence --id unit` or just `bb bridge auto` to run all tests and update evidences.
+
+It also includes a Criterium benchmark alias:
+
+```sh
+clojure -M:bench
+```
+
+The alias includes the JVM 17+ Criterium blackhole flags:
+
+```sh
+-XX:+UnlockExperimentalVMOptions
+-XX:CompileCommand=blackhole,criterium.blackhole.Blackhole::consume
+```
+
+The benchmark suite builds deterministic flat `[row col payload]` entries, then constructs each compared representation from that same source:
+
+- a frozen `sparse-layout` dataset with CSR and CSC indexes
+- a nested row-only index, `row-key -> col-key -> payload-vector`
+- a nested dual index with both `row-key -> col-key -> payload-vector` and `col-key -> row-key -> payload-vector`
+
+It compares point lookup, row scans, column scans, row-only full column scans, and construction cost from the shared entry source. Benchmarks run for scalar row/column keys and for compound Clojure map row/column keys with several key-value pairs.
+
+`clojure -M:bench` uses Criterium's quick benchmark mode for the standard small scalar and compound-map scenarios. Include larger dataset increments with:
+
+```sh
+clojure -M:bench large
+```
+
+Filter by key shape with:
+
+```sh
+clojure -M:bench scalar
+clojure -M:bench compound
+```
+
+Filters compose, so `clojure -M:bench scalar large` runs all scalar-key increments. Use `medium` or `large-only` for a single larger scale.
+
+Measure retained object graph sizes with the separate `:memory` alias. This alias uses `clj-memory-meter` and includes JVM flags for dynamic agent loading:
+
+```sh
+clojure -M:memory
+clojure -M:memory scalar large
+```
+
+The memory report measures each root independently and prints total retained size plus bytes per non-zero entry for:
+
+- the flat source entries
+- the frozen sparse dataset with CSR and CSC
+- the nested row-only index
+- the nested dual row+column index
+
+Use the longer Criterium mode with:
+
+```sh
+clojure -M:bench full
+```
+
+To compile the benchmark namespace and run each benchmarked operation once without Criterium timing, use:
+
+```sh
+clojure -M:bench smoke
 ```

@@ -1,0 +1,5 @@
+{:deps {io.github.enajski/bridge {:git/sha "7556bc83ce38ef382326a7782ba9c4be6d7ea6e7"}}
+ :tasks
+ {bridge {:doc "Runs the Bridge verification workflow CLI"
+          :requires ([bridge.cli :as cli])
+          :task (apply cli/-main *command-line-args*)}}}
