@@ -179,6 +179,63 @@
          #"Zero-copy block views require block payload storage"
          (scalar-features-block-view ds :a :x)))))
 
+(defn- ingest-entries [layout entries]
+  (let [builder (sparse/make-builder layout)]
+    (doseq [[row col payload] entries]
+      (sparse/append-entry! builder row col payload))
+    builder))
+
+(defn- csr-cols-strictly-increasing? [frozen]
+  (let [^ints ptrs (:csr-row-ptrs frozen)
+        ^ints cols (:csr-col-ids frozen)]
+    (every? (fn [r]
+              (let [start (aget ptrs r)
+                    end (aget ptrs (inc r))]
+                (apply < -1 (map #(aget cols (int %)) (range start end)))))
+            (range (dec (alength ptrs))))))
+
+(defn- csc-rows-strictly-increasing? [frozen]
+  (let [^ints ptrs (:csc-col-ptrs frozen)
+        ^ints rows (:csc-row-ids frozen)]
+    (every? (fn [c]
+              (let [start (aget ptrs c)
+                    end (aget ptrs (inc c))]
+                (apply < -1 (map #(aget rows (int %)) (range start end)))))
+            (range (dec (alength ptrs))))))
+
+(def ^:private base-layout
+  {:row-key [:entity] :cols-path [:vals] :indices #{:csr :csc}})
+
+(def ^:private comparison-cases
+  [{:label :double-last
+    :layout (assoc base-layout :payload :double)
+    :entries [[3 :b 1.0] [1 :a 2.0] [3 :a 3.0] [1 :a 4.0]
+              [2 :c 5.0] [3 :b 6.0] [1 :b 7.0] [2 :a 8.0]]}
+   {:label :double-sum
+    :layout (assoc base-layout :payload :double :duplicate-policy :sum)
+    :entries [[3 :b 1.0] [1 :a 2.0] [3 :a 3.0] [1 :a 4.0]
+              [2 :c 5.0] [3 :b 6.0] [1 :b 7.0] [2 :a 8.0]]}
+   {:label :fixed-block-last
+    :layout (assoc base-layout :payload {:kind :fixed-double-block :dim 2})
+    :entries [[3 :b [1.0 2.0]] [1 :a [3.0 4.0]] [3 :a [5.0 6.0]]
+              [1 :a [7.0 8.0]] [2 :c [9.0 10.0]] [1 :b [11.0 12.0]]]}
+   {:label :var-block-last
+    :layout (assoc base-layout :payload {:kind :var-double-block})
+    :entries [[2 :x [1.0]] [1 :y [2.0 3.0]] [2 :x [4.0 5.0 6.0]]
+              [1 :z [7.0]] [3 :y [8.0 9.0]]]}
+   {:label :object-merge
+    :layout (assoc base-layout :payload :object :duplicate-policy :merge :merge-fn merge)
+    :entries [[1 :m {:a 1}] [2 :m {:b 2}] [1 :m {:c 3}] [1 :n {:d 4}] [2 :n {:e 5}]]}])
+
+(deftest freeze-builder-preserves-index-ordering-invariants
+  (doseq [{:keys [label layout entries]} comparison-cases]
+    (testing (str label ": freeze preserves lookup ordering invariants")
+      (let [frozen (sparse/freeze-builder! (ingest-entries layout entries))]
+        (is (csr-cols-strictly-increasing? frozen)
+            "columns are sorted within each CSR row (point-lookup invariant)")
+        (is (csc-rows-strictly-increasing? frozen)
+            "rows are sorted within each CSC column")))))
+
 (deftest retain-coo-is-configurable-at-freeze-time
   (let [rows [{:entity 1 :vals (array-map :f1 [1.0 2.0 3.0]
                                           :f2 [4.0 5.0 6.0])}

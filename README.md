@@ -308,3 +308,17 @@ To compile the benchmark namespace and run each benchmarked operation once witho
 ```sh
 clojure -M:bench smoke
 ```
+
+## Construction Benchmark
+
+The `:construct` alias isolates the freeze step (COO → CSR/CSC) and reports
+wall-clock mean plus per-call heap allocation for the shipped freeze path:
+
+```sh
+clojure -M:construct
+clojure -M:construct scalar large
+clojure -M:construct compound medium
+```
+
+This alias is intended as a local validation tool; long-form construction notes
+are maintained in the project wiki rather than this repository.

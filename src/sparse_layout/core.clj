@@ -1,6 +1,12 @@
 (ns sparse-layout.core
   (:require [clojure.string :as str])
-  (:import [java.util ArrayList Arrays Collections Comparator HashMap Map]))
+  (:import [java.util ArrayList Collections HashMap Map]))
+
+;; Hot-path guard: this namespace must compile without reflection. The freeze
+;; and query paths use primitive array access throughout; a dropped type hint
+;; or a reflective `aset-*` form (which routes through java.lang.reflect.Array
+;; at ~60ns/store) would silently regress construction by orders of magnitude.
+(set! *warn-on-reflection* true)
 
 (defprotocol SparseDataset
   (row-id [this row-key])
@@ -134,21 +140,21 @@
 (defn- ib-add! [^IntBuffer buffer ^long value]
   (let [size (buf-size buffer)]
     (ib-ensure! buffer (inc size))
-    (aset-int ^ints (buf-data buffer) size (int value))
+    (aset ^ints (buf-data buffer) size (int value))
     (buf-set-size! buffer (inc size))
     buffer))
 
 (defn- db-add! [^DoubleBuffer buffer ^double value]
   (let [size (buf-size buffer)]
     (db-ensure! buffer (inc size))
-    (aset-double ^doubles (buf-data buffer) size value)
+    (aset ^doubles (buf-data buffer) size value)
     (buf-set-size! buffer (inc size))
     buffer))
 
 (defn- lb-add! [^LongBuffer buffer ^long value]
   (let [size (buf-size buffer)]
     (lb-ensure! buffer (inc size))
-    (aset-long ^longs (buf-data buffer) size value)
+    (aset ^longs (buf-data buffer) size value)
     (buf-set-size! buffer (inc size))
     buffer))
 
@@ -270,7 +276,7 @@
           (loop [i 0
                  xs (seq value)]
             (when xs
-              (aset-double dest (int (+ offset i)) (double (first xs)))
+              (aset dest (int (+ offset i)) (double (first xs)))
               (recur (inc i) (next xs)))))
         (throw (ex "Payload must be a double array or sequence of numbers."
                    {:value value
@@ -320,7 +326,8 @@
   (-payload-at [this edge-id])
   (-payload-count [this])
   (-payload-kind [this])
-  (-payload-dim [this]))
+  (-payload-dim [this])
+  (-gather-storage [this ids m]))
 
 (deftype DoublePayloadBuffer [^DoubleBuffer values]
   PayloadBuffer
@@ -333,7 +340,16 @@
   (-payload-kind [_]
     :double)
   (-payload-dim [_]
-    1))
+    1)
+  (-gather-storage [_ ids m]
+    (let [ids ^ints ids
+          m (long m)
+          data ^doubles (buf-data values)
+          out (double-array m)]
+      (dotimes [i m]
+        (aset out i (aget data (aget ids i))))
+      {:payload-values out
+       :payload-ptrs nil})))
 
 (deftype LongPayloadBuffer [^LongBuffer values]
   PayloadBuffer
@@ -346,7 +362,16 @@
   (-payload-kind [_]
     :long)
   (-payload-dim [_]
-    1))
+    1)
+  (-gather-storage [_ ids m]
+    (let [ids ^ints ids
+          m (long m)
+          data ^longs (buf-data values)
+          out (long-array m)]
+      (dotimes [i m]
+        (aset out i (aget data (aget ids i))))
+      {:payload-values out
+       :payload-ptrs nil})))
 
 (deftype ObjectPayloadBuffer [^ObjectBuffer values]
   PayloadBuffer
@@ -359,7 +384,16 @@
   (-payload-kind [_]
     :object)
   (-payload-dim [_]
-    1))
+    1)
+  (-gather-storage [_ ids m]
+    (let [ids ^ints ids
+          m (long m)
+          data ^objects (buf-data values)
+          out (object-array m)]
+      (dotimes [i m]
+        (aset out i (aget data (aget ids i))))
+      {:payload-values out
+       :payload-ptrs nil})))
 
 (deftype FixedDoubleBlockPayloadBuffer [^long dim ^DoubleBuffer values ^IntBuffer count]
   PayloadBuffer
@@ -376,7 +410,18 @@
   (-payload-kind [_]
     :fixed-double-block)
   (-payload-dim [_]
-    dim))
+    dim)
+  (-gather-storage [_ ids m]
+    (let [ids ^ints ids
+          m (long m)
+          dim (long dim)
+          data ^doubles (buf-data values)
+          out (double-array (* m dim))]
+      (dotimes [i m]
+        (System/arraycopy data (int (* (aget ids i) dim))
+                          out (int (* i dim)) (int dim)))
+      {:payload-values out
+       :payload-ptrs nil})))
 
 (deftype VarDoubleBlockPayloadBuffer [^IntBuffer ptrs ^DoubleBuffer values]
   PayloadBuffer
@@ -395,7 +440,27 @@
   (-payload-kind [_]
     :var-double-block)
   (-payload-dim [_]
-    -1))
+    -1)
+  (-gather-storage [_ ids m]
+    (let [ids ^ints ids
+          m (long m)
+          src-ptrs ^ints (buf-data ptrs)
+          src-vals ^doubles (buf-data values)
+          out-ptrs (int-array (inc m))
+          out-values (double-buffer)]
+      (dotimes [i m]
+        (let [id (aget ids i)
+              start (aget src-ptrs id)
+              end (aget src-ptrs (inc id))
+              length (- end start)
+              dest-start (db-size out-values)]
+          (db-ensure! out-values (+ dest-start length))
+          (System/arraycopy src-vals start (buf-data out-values)
+                            (int dest-start) length)
+          (buf-set-size! out-values (+ dest-start length))
+          (aset out-ptrs (inc i) (int (db-size out-values)))))
+      {:payload-values (db->array out-values)
+       :payload-ptrs out-ptrs})))
 
 (defn- payload-buffer [payload]
   (case (:kind payload)
@@ -452,24 +517,45 @@
     (-append-payload! (.-payloadBuffer builder) payload)
     builder))
 
-(defn- edge-order ^objects [^ints rows ^ints cols ^long n]
-  (let [ids (object-array n)]
+(defn- stable-counting-sort
+  "Stable counting sort of edge ids. `perm` is the current ordering and `keys`
+  maps each edge id to a bucket in [0, k). Returns a fresh int[] ordering sorted
+  by bucket, preserving the relative order of equal buckets. O(n + k)."
+  ^ints [^ints perm ^ints keys ^long n ^long k]
+  (let [counts (int-array (max 1 k))
+        out (int-array n)]
     (dotimes [i n]
-      (aset ids i (Integer/valueOf i)))
-    (Arrays/sort
-     ids
-     (reify Comparator
-       (compare [_ a b]
-         (let [ai (int a)
-               bi (int b)
-               row-compare (Integer/compare (aget rows ai) (aget rows bi))]
-           (if (zero? row-compare)
-             (let [col-compare (Integer/compare (aget cols ai) (aget cols bi))]
-               (if (zero? col-compare)
-                 (Integer/compare ai bi)
-                 col-compare))
-             row-compare)))))
-    ids))
+      (let [bucket (aget keys (aget perm i))]
+        (aset counts bucket (inc (aget counts bucket)))))
+    (loop [bucket 0
+           sum 0]
+      (when (< bucket k)
+        (let [c (aget counts bucket)]
+          (aset counts bucket sum)
+          (recur (inc bucket) (+ sum c)))))
+    (dotimes [i n]
+      (let [edge (aget perm i)
+            bucket (aget keys edge)
+            pos (aget counts bucket)]
+        (aset out pos edge)
+        (aset counts bucket (inc pos))))
+    out))
+
+(defn- edge-order
+  "Returns an int[] ordering of the n COO edges sorted by (row, col) using two
+  stable counting-sort passes (LSD radix on col then row). Equal (row, col)
+  pairs keep ascending edge-id order, preserving duplicate-policy semantics.
+  O(n + rows + cols), no boxing."
+  ^ints [^ints rows ^ints cols n row-count col-count]
+  (let [n (long n)
+        row-count (long row-count)
+        col-count (long col-count)
+        perm (int-array n)]
+    (dotimes [i n]
+      (aset perm i i))
+    (-> perm
+        (stable-counting-sort cols n col-count)
+        (stable-counting-sort rows n row-count))))
 
 (defn- sum-double-values ^doubles [left right expected]
   (let [left (double-array-value left expected :sum-left)
@@ -477,7 +563,7 @@
         length (alength left)
         out (double-array length)]
     (dotimes [i length]
-      (aset-double out i (+ (aget left i) (aget right i))))
+      (aset out i (+ (aget left i) (aget right i))))
     out))
 
 (defn- sum-payload [payload left right]
@@ -508,54 +594,104 @@
                       {:row-id row-id
                        :col-id col-id}))))
 
+(defn- coalesce-referencing
+  "Coalesces (row, col)-sorted COO edges for non-combining policies. Emits
+  compact row/col arrays plus `payload-ids` referencing the original payload
+  buffer so storage can be gathered without boxing intermediate payloads."
+  [^ints rows ^ints cols ^ints order n policy]
+  (let [n (long n)
+        error? (= policy :error)
+        out-rows (int-buffer n)
+        out-cols (int-buffer n)
+        out-ids (int-buffer n)]
+    (loop [pos 0
+           have-current? false
+           current-row -1
+           current-col -1
+           current-id -1]
+      (if (= pos n)
+        (do
+          (when have-current?
+            (ib-add! out-rows current-row)
+            (ib-add! out-cols current-col)
+            (ib-add! out-ids current-id))
+          {:rows (ib->array out-rows)
+           :cols (ib->array out-cols)
+           :payload-ids (ib->array out-ids)})
+        (let [edge-id (aget order pos)
+              row (aget rows edge-id)
+              col (aget cols edge-id)]
+          (if (and have-current? (= current-row row) (= current-col col))
+            (if error?
+              (throw (ex "Duplicate sparse coordinate."
+                         {:row-id row
+                          :col-id col}))
+              ;; :last wins: order is ascending edge-id within a duplicate run,
+              ;; so the final edge-id is the most-recently ingested one.
+              (recur (inc pos) true current-row current-col edge-id))
+            (do
+              (when have-current?
+                (ib-add! out-rows current-row)
+                (ib-add! out-cols current-col)
+                (ib-add! out-ids current-id))
+              (recur (inc pos) true row col edge-id))))))))
+
+(defn- coalesce-combining
+  "Coalesces (row, col)-sorted COO edges for :sum/:merge policies, materializing
+  combined payloads into an ArrayList in coalesced order."
+  [layout ^ints rows ^ints cols payload-buffer ^ints order n]
+  (let [n (long n)
+        out-rows (int-buffer n)
+        out-cols (int-buffer n)
+        out-payloads (ArrayList.)]
+    (loop [pos 0
+           have-current? false
+           current-row -1
+           current-col -1
+           current-payload nil]
+      (if (= pos n)
+        (do
+          (when have-current?
+            (ib-add! out-rows current-row)
+            (ib-add! out-cols current-col)
+            (.add out-payloads current-payload))
+          {:rows (ib->array out-rows)
+           :cols (ib->array out-cols)
+           :payloads out-payloads})
+        (let [edge-id (aget order pos)
+              row (aget rows edge-id)
+              col (aget cols edge-id)
+              payload (-payload-at payload-buffer edge-id)]
+          (if (and have-current? (= current-row row) (= current-col col))
+            (recur (inc pos)
+                   true
+                   current-row
+                   current-col
+                   (combine-duplicate layout current-payload payload row col))
+            (do
+              (when have-current?
+                (ib-add! out-rows current-row)
+                (ib-add! out-cols current-col)
+                (.add out-payloads current-payload))
+              (recur (inc pos) true row col payload))))))))
+
 (defn- coalesce-builder [^SparseBuilder builder]
   (let [rows (ib->array (.-rows builder))
         cols (ib->array (.-cols builder))
         payload-buffer (.-payloadBuffer builder)
+        layout (.-layout builder)
+        policy (:duplicate-policy layout)
+        row-count (.size ^ArrayList (.-idToRow builder))
+        col-count (.size ^ArrayList (.-idToCol builder))
         n (alength rows)]
     (when-not (= n (-payload-count payload-buffer))
       (throw (ex "COO coordinate and payload counts diverged."
                  {:coordinates n
                   :payloads (-payload-count payload-buffer)})))
-    (let [order (edge-order rows cols n)
-          out-rows (int-buffer n)
-          out-cols (int-buffer n)
-          out-payloads (ArrayList.)]
-      (loop [pos 0
-             have-current? false
-             current-row -1
-             current-col -1
-             current-payload nil]
-        (if (= pos n)
-          (do
-            (when have-current?
-              (ib-add! out-rows current-row)
-              (ib-add! out-cols current-col)
-              (.add out-payloads current-payload))
-            {:rows (ib->array out-rows)
-             :cols (ib->array out-cols)
-             :payloads out-payloads})
-          (let [edge-id (int (aget order pos))
-                row (aget rows edge-id)
-                col (aget cols edge-id)
-                payload (-payload-at payload-buffer edge-id)]
-            (if-not have-current?
-              (recur (inc pos) true row col payload)
-              (if (and (= current-row row) (= current-col col))
-                (recur (inc pos)
-                       true
-                       current-row
-                       current-col
-                       (combine-duplicate (.-layout builder)
-                                          current-payload
-                                          payload
-                                          row
-                                          col))
-                (do
-                  (ib-add! out-rows current-row)
-                  (ib-add! out-cols current-col)
-                  (.add out-payloads current-payload)
-                  (recur (inc pos) true row col payload))))))))))
+    (let [order (edge-order rows cols n row-count col-count)]
+      (if (or (= policy :sum) (= policy :merge))
+        (coalesce-combining layout rows cols payload-buffer order n)
+        (coalesce-referencing rows cols order n policy)))))
 
 (defn- compile-payload-storage [payload ^ArrayList payloads]
   (let [n (.size payloads)]
@@ -563,14 +699,14 @@
       :double
       (let [values (double-array n)]
         (dotimes [i n]
-          (aset-double values i (double (.get payloads i))))
+          (aset values i (double (.get payloads i))))
         {:payload-values values
          :payload-ptrs nil})
 
       :long
       (let [values (long-array n)]
         (dotimes [i n]
-          (aset-long values i (long (.get payloads i))))
+          (aset values i (long (.get payloads i))))
         {:payload-values values
          :payload-ptrs nil})
 
@@ -594,7 +730,7 @@
             values (double-buffer)]
         (dotimes [i n]
           (append-var-double-block! values (.get payloads i))
-          (aset-int ptrs (inc i) (int (db-size values))))
+          (aset ptrs (inc i) (int (db-size values))))
         {:payload-values (db->array values)
          :payload-ptrs ptrs}))))
 
@@ -604,42 +740,41 @@
           col-ids (int-array nnz)]
       (dotimes [payload-id nnz]
         (let [row (aget edge-rows payload-id)]
-          (aset-int row-ptrs (inc row) (inc (aget row-ptrs (inc row))))))
+          (aset row-ptrs (inc row) (inc (aget row-ptrs (inc row))))))
       (dotimes [row row-count]
-        (aset-int row-ptrs (inc row) (+ (aget row-ptrs row)
+        (aset row-ptrs (inc row) (+ (aget row-ptrs row)
                                         (aget row-ptrs (inc row)))))
       (dotimes [payload-id nnz]
-        (aset-int col-ids payload-id (aget edge-cols payload-id)))
+        (aset col-ids payload-id (aget edge-cols payload-id)))
       {:csr-row-ptrs row-ptrs
        :csr-col-ids col-ids})))
 
-(defn- build-csc [indices ^ints edge-rows ^ints edge-cols col-count nnz]
+(defn- build-csc
+  "Builds the CSC index from coalesced, (row, col)-sorted edges with a single
+  stable counting pass on the column. Because the input is already row-major,
+  rows within each column emerge in ascending order without a comparison sort.
+  O(nnz + cols)."
+  [indices ^ints edge-rows ^ints edge-cols col-count nnz]
   (when (contains? indices :csc)
-    (let [col-ptrs (int-array (inc col-count))
-          ids (object-array nnz)
+    (let [col-count (long col-count)
+          nnz (long nnz)
+          col-ptrs (int-array (inc col-count))
           row-ids (int-array nnz)
-          payload-ids (int-array nnz)]
+          payload-ids (int-array nnz)
+          cursor (int-array (max 1 col-count))]
       (dotimes [payload-id nnz]
         (let [col (aget edge-cols payload-id)]
-          (aset-int col-ptrs (inc col) (inc (aget col-ptrs (inc col))))
-          (aset ids payload-id (Integer/valueOf payload-id))))
+          (aset col-ptrs (inc col) (inc (aget col-ptrs (inc col))))))
       (dotimes [col col-count]
-        (aset-int col-ptrs (inc col) (+ (aget col-ptrs col)
-                                        (aget col-ptrs (inc col)))))
-      (Arrays/sort
-       ids
-       (reify Comparator
-         (compare [_ a b]
-           (let [ai (int a)
-                 bi (int b)
-                 col-compare (Integer/compare (aget edge-cols ai) (aget edge-cols bi))]
-             (if (zero? col-compare)
-               (Integer/compare (aget edge-rows ai) (aget edge-rows bi))
-               col-compare)))))
-      (dotimes [i nnz]
-        (let [payload-id (int (aget ids i))]
-          (aset-int row-ids i (aget edge-rows payload-id))
-          (aset-int payload-ids i payload-id)))
+        (aset col-ptrs (inc col) (+ (aget col-ptrs col)
+                                        (aget col-ptrs (inc col))))
+        (aset cursor col (aget col-ptrs col)))
+      (dotimes [payload-id nnz]
+        (let [col (aget edge-cols payload-id)
+              pos (aget cursor col)]
+          (aset row-ids pos (aget edge-rows payload-id))
+          (aset payload-ids pos payload-id)
+          (aset cursor col (inc pos))))
       {:csc-col-ptrs col-ptrs
        :csc-row-ids row-ids
        :csc-payload-ids payload-ids})))
@@ -647,10 +782,23 @@
 (defn- frozen-map ^Map [^HashMap source]
   (Collections/unmodifiableMap (HashMap. source)))
 
+(defn- frozen-base [^SparseBuilder builder layout payload ^ints edge-rows ^ints edge-cols]
+  {:row->id (frozen-map (.-rowToId builder))
+   :id->row (.toArray ^ArrayList (.-idToRow builder))
+   :col->id (frozen-map (.-colToId builder))
+   :id->col (.toArray ^ArrayList (.-idToCol builder))
+   :edge-rows (when (:retain-coo? layout) edge-rows)
+   :edge-cols (when (:retain-coo? layout) edge-cols)
+   :payload-kind (:kind payload)
+   :payload-dim (long (or (:dim payload) -1))})
+
 (defn freeze-builder!
   "Compiles a mutable COO builder into frozen primitive arrays and dictionaries.
 
-  The returned map is intended for code generated by `defsparse`."
+  Uses counting-sort ordering and, for non-combining duplicate policies,
+  gathers payload storage directly from the ingest buffers without an
+  intermediate boxed `ArrayList`. The returned map is intended for code
+  generated by `defsparse`."
   [^SparseBuilder builder]
   (let [layout (.-layout builder)
         payload (:payload layout)
@@ -659,19 +807,14 @@
         coalesced (coalesce-builder builder)
         edge-rows ^ints (:rows coalesced)
         edge-cols ^ints (:cols coalesced)
-        payloads ^ArrayList (:payloads coalesced)
         nnz (alength edge-rows)
-        payload-storage (compile-payload-storage payload payloads)
+        payload-ids (:payload-ids coalesced)
+        payload-storage (if payload-ids
+                          (-gather-storage (.-payloadBuffer builder) payload-ids nnz)
+                          (compile-payload-storage payload (:payloads coalesced)))
         csr (or (build-csr (:indices layout) edge-rows edge-cols row-count nnz) {})
         csc (or (build-csc (:indices layout) edge-rows edge-cols col-count nnz) {})]
-    (merge {:row->id (frozen-map (.-rowToId builder))
-            :id->row (.toArray ^ArrayList (.-idToRow builder))
-            :col->id (frozen-map (.-colToId builder))
-            :id->col (.toArray ^ArrayList (.-idToCol builder))
-            :edge-rows (when (:retain-coo? layout) edge-rows)
-            :edge-cols (when (:retain-coo? layout) edge-cols)
-            :payload-kind (:kind payload)
-            :payload-dim (long (or (:dim payload) -1))}
+    (merge (frozen-base builder layout payload edge-rows edge-cols)
            payload-storage
            csr
            csc)))
