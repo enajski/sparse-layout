@@ -1,7 +1,8 @@
 (ns sparse-layout.bench-data
   (:require [sparse-layout.core :as sparse]
             [sparse-layout.core :refer [defsparse]]
-            [sparse-layout.facade :as facade]))
+            [sparse-layout.facade :as facade])
+  (:import [mikera.vectorz Vector]))
 
 (def block-dim 4)
 
@@ -137,6 +138,12 @@
            :cols {}}
           entries))
 
+(defn entries->nested-row-vectorz-index [entries]
+  (reduce (fn [rows [row col payload]]
+            (update rows row assoc col (Vector/of ^doubles (double-array payload))))
+          {}
+          entries))
+
 (defn first-payload-value ^double [payload]
   (double (nth payload 0)))
 
@@ -149,6 +156,9 @@
 (defn nested-row-point-value ^double [nested-rows row col]
   (first-payload-value (get-in nested-rows [row col])))
 
+(defn nested-vectorz-point-value ^double [nested-rows row col]
+  (.get ^Vector (get-in nested-rows [row col]) (int 0)))
+
 (defn sparse-row-map-sum ^double [ds row]
   (reduce-kv (fn [sum _ view]
                (+ (double sum)
@@ -160,6 +170,12 @@
   (reduce-kv (fn [sum _ payload]
                (+ (double sum)
                   (first-payload-value payload)))
+             0.0
+             (get nested-rows row)))
+
+(defn nested-vectorz-row-map-sum ^double [nested-rows row]
+  (reduce-kv (fn [^double sum _ ^Vector v]
+               (+ sum (.get v (int 0))))
              0.0
              (get nested-rows row)))
 
@@ -192,6 +208,7 @@
         sparse-map (facade/as-view-map sparse)
         nested-rows (entries->nested-row-index entries)
         nested-dual (entries->nested-dual-index entries)
+        nested-vectorz (entries->nested-row-vectorz-index entries)
         hot-row-id (quot row-count 2)
         hot-col-id (first (row-col-ids hot-row-id col-count nnz-per-row))
         row-key ((row-key-fn config) hot-row-id)
@@ -203,6 +220,7 @@
      :sparse-map sparse-map
      :nested-rows nested-rows
      :nested-dual nested-dual
+     :nested-vectorz nested-vectorz
      :row-key (equivalent-query-key row-key)
      :col-key (equivalent-query-key col-key)
      :scan-col (equivalent-query-key scan-col)}))

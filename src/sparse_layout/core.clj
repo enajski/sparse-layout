@@ -3,9 +3,10 @@
   (:import [java.util ArrayList Collections HashMap Map]))
 
 ;; Hot-path guard: this namespace must compile without reflection. The freeze
-;; and query paths use primitive array access throughout; a dropped type hint
-;; or a reflective `aset-*` form (which routes through java.lang.reflect.Array
-;; at ~60ns/store) would silently regress construction by orders of magnitude.
+;; and query paths use primitive array access throughout; `aset-int` /
+;; `aset-long` / `aset-double` route through `java.lang.reflect.Array.setXxx`,
+;; while type-hinted `aset` can compile through `clojure.lang.RT/aset` to
+;; direct primitive array stores.
 (set! *warn-on-reflection* true)
 
 (defprotocol SparseDataset

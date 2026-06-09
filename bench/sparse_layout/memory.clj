@@ -25,12 +25,13 @@
 
 (defn- memory-config [config]
   (data/print-config config)
-  (let [{:keys [entries sparse nested-rows nested-dual]} (data/prepare config)]
+  (let [{:keys [entries sparse nested-rows nested-dual nested-vectorz]} (data/prepare config)]
     (println)
     (println "Retained object graph size, measured independently from each root:")
     (print-memory-row config "flat source entries" (measure-bytes entries))
     (print-memory-row config "sparse frozen dataset, CSR+CSC" (measure-bytes sparse))
-    (print-memory-row config "nested row-only index" (measure-bytes nested-rows))
+    (print-memory-row config "nested row-only index (persistent vector)" (measure-bytes nested-rows))
+    (print-memory-row config "nested row-only index (vectorz)" (measure-bytes nested-vectorz))
     (print-memory-row config "nested dual row+column index" (measure-bytes nested-dual))))
 
 (defn memory-report
