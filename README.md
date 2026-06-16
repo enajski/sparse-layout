@@ -164,6 +164,49 @@ For zero-copy block traversal, use view facades:
 (sparse-layout.core/block-view-value (get-in vm [1 :f2]) 0)
 ```
 
+## CSR Source Layer
+
+The `sparse-layout.csr-source` namespace exposes a lower-level storage API for fixed double block datasets. It adapts a frozen dataset into a `CSRSource` so callers can scan CSR rows or query-shaped row ranges and copy payload blocks into caller-owned `double[]` buffers without allocating one block per entry.
+
+```clojure
+(require '[sparse-layout.csr-source :as csr])
+
+(def source (csr/dataset->csr-source ds))
+(def out (double-array (csr/csr-block-dim source)))
+
+(csr/csr-copy-block! source 0 out 0)
+```
+
+`with-range-index` builds prefix ranges over an ordered row-key projection:
+
+```clojure
+(def ranged-source
+  (csr/with-range-index source identity))
+
+(csr/csr-resolve-ranges ranged-source {:prefix [:tenant-a :portfolio-1]})
+;; => [{:row-start 0 :row-end 42}]
+```
+
+For mutable overlays, use `make-dok-delta` and merged scans. Delta puts override main entries, deletes tombstone main entries, and delta-only entries for existing rows appear in deterministic column order.
+
+The first implementation is heap-backed and fixed-double-block-only. `MmapCSRSource` is intentionally a backend skeleton so consumers can depend on the `CSRSource` protocol before the mmap artifact reader exists.
+
+## Executable Documentation
+
+This repo includes a Clerk notebook at `notebooks/sparse_layout/csr_source_notebook.clj` that walks through the CSR source layer end to end: logical records, frozen CSR internals, storage-level scans, query-shaped range indexes, mutable deltas, merged rows, and the mmap backend boundary.
+
+Serve the notebook locally:
+
+```bash
+clojure -X:clerk
+```
+
+Then open `http://localhost:7777` and select the CSR source notebook. To build static HTML:
+
+```bash
+clojure -X:clerk:clerk/build
+```
+
 ## Storage Model
 
 Ingest starts with mutable COO buffers:

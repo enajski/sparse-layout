@@ -1,7 +1,14 @@
 {:paths ["src"]
  :aliases
  {:test {:extra-paths ["test"]
-         :main-opts ["-e" "(do (require 'clojure.test 'sparse-layout.core-test 'sparse-layout.facade-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.core-test 'sparse-layout.facade-test)] (when (pos? (+ fail error)) (System/exit 1))))"]}
+         :main-opts ["-e" "(do (require 'clojure.test 'sparse-layout.core-test 'sparse-layout.facade-test 'sparse-layout.csr-source-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.core-test 'sparse-layout.facade-test 'sparse-layout.csr-source-test)] (when (pos? (+ fail error)) (System/exit 1))))"]}
+  :clerk {:extra-paths ["notebooks"]
+          :extra-deps {io.github.nextjournal/clerk {:mvn/version "0.18.1158"}}
+          :exec-fn nextjournal.clerk/serve!
+          :exec-args {:watch-paths ["notebooks" "src"]
+                      :browse false}}
+  :clerk/build {:exec-fn nextjournal.clerk/build!
+                :exec-args {:paths ["notebooks/sparse_layout/csr_source_notebook.clj"]}}
   :bench {:extra-paths ["bench"]
           :extra-deps {criterium/criterium {:mvn/version "0.5.243-ALPHA"}
                        net.mikera/vectorz-clj {:mvn/version "0.48.0"}}

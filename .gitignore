@@ -1,4 +1,6 @@
 .cpcache/
+.clerk/
+public/
 .gitprobe
 .git-test/
 .calva/
