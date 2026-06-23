@@ -174,8 +174,15 @@ The `sparse-layout.csr-source` namespace exposes a lower-level storage API for f
 (def source (csr/dataset->csr-source ds))
 (def out (double-array (csr/csr-block-dim source)))
 
+(csr/csr-col-count source)
+;; => 12
+
 (csr/csr-copy-block! source 0 out 0)
 ```
+
+`CSRSource` exposes explicit row, column, and entry counts. Row ids, column ids,
+and entry ids are valid only inside their respective count ranges; heap and mmap
+sources reject out-of-range ids instead of reading arbitrary storage.
 
 `with-range-index` builds prefix ranges over an ordered row-key projection:
 
@@ -187,7 +194,18 @@ The `sparse-layout.csr-source` namespace exposes a lower-level storage API for f
 ;; => [{:row-start 0 :row-end 42}]
 ```
 
-For mutable overlays, use `make-dok-delta` and merged scans. Delta puts override main entries, deletes tombstone main entries, and delta-only entries for existing rows appear in deterministic column order.
+For mutable overlays, use `make-dok-delta-for-source` and merged scans:
+
+```clojure
+(def delta (csr/make-dok-delta-for-source source))
+
+(csr/delta-put! delta :row-a :col-b [1.0 2.0 3.0])
+(csr/delta-delete! delta :row-a :col-c)
+
+(csr/scan-merged-row! source delta :row-a visitor)
+```
+
+Delta puts override main entries, deletes tombstone main entries, and delta-only entries for existing rows appear in deterministic column order. Use `make-dok-delta` directly only when you already have an explicit block dimension. Dimensioned deltas reject blocks whose length does not match the source block dimension.
 
 The source layer can also persist fixed-double-block CSR sources to a language-neutral mmap artifact:
 
@@ -198,7 +216,7 @@ The source layer can also persist fixed-double-block CSR sources to a language-n
 (csr/csr-copy-block! mmap-source 0 out 0)
 ```
 
-The v1 artifact is a single little-endian binary file with a fixed header, section table, primitive CSR sections, payload doubles, and typed row/column key dictionaries. Readers rebuild key lookup maps on open while keeping row pointers, column ids, and payload values mmap-backed.
+The v1 artifact is a single little-endian binary file with a fixed header, section table, primitive CSR sections, payload doubles, and typed row/column key dictionaries. Readers validate the section table, CSR row pointers, column ids, and key dictionaries on open, throwing `ex-info` for corrupt artifacts. They rebuild key lookup maps on open while keeping row pointers, column ids, and payload values mmap-backed. The current JVM reader maps the artifact as one `ByteBuffer`, so files must be smaller than `Integer/MAX_VALUE`; the mapping is GC-managed and remains live while the returned source is reachable.
 
 ## Executable Documentation
 
@@ -270,7 +288,7 @@ Supported payload specs:
 - `{:kind :fixed-double-block :dim n}`
 - `{:kind :var-double-block}`
 
-Fixed and variable double blocks are returned as fresh `double[]` values from public block accessors.
+Fixed and variable double blocks are returned as fresh `double[]` values from generated block accessors.
 
 ## Duplicate Policies
 

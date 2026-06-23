@@ -1,5 +1,5 @@
 (ns sparse-layout.csr-source-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is]]
             [sparse-layout.core :refer [defsparse]]
             [sparse-layout.csr-source :as csr])
   (:import [java.nio ByteBuffer ByteOrder]
@@ -92,6 +92,11 @@
   (Files/createTempFile "sparse-layout-csr-" ".slcsr"
                         (make-array java.nio.file.attribute.FileAttribute 0)))
 
+(defn- artifact-magic-bytes []
+  (byte-array
+   (concat (seq (.getBytes "SLCSR" "US-ASCII"))
+           [(byte 0) (byte 1) (byte 0)])))
+
 (defn- artifact-bytes [source]
   (let [path (temp-artifact)]
     (try
@@ -99,6 +104,21 @@
       (Files/readAllBytes path)
       (finally
         (Files/deleteIfExists path)))))
+
+(defn- section-entry-offset [section-id]
+  (+ 64 (* 32 (dec section-id))))
+
+(defn- section-offset [^ByteBuffer buffer section-id]
+  (.getLong buffer (+ (section-entry-offset section-id) 16)))
+
+(defn- corrupt-artifact-path [source mutate!]
+  (let [path (temp-artifact)
+        bytes (artifact-bytes source)
+        buffer (doto (ByteBuffer/wrap bytes)
+                 (.order ByteOrder/LITTLE_ENDIAN))]
+    (mutate! buffer)
+    (Files/write path bytes (make-array StandardOpenOption 0))
+    path))
 
 (defn- roundtrip-source [source f]
   (let [path (temp-artifact)]
@@ -111,6 +131,7 @@
 (deftest adapts-fixed-double-block-dataset-to-heap-csr-source
   (let [source (csr/dataset->csr-source (test-dataset))]
     (is (= 4 (csr/csr-row-count source)))
+    (is (= 2 (csr/csr-col-count source)))
     (is (= 5 (csr/csr-entry-count source)))
     (is (= 3 (csr/csr-block-dim source)))
     (is (= [:tenant-a :portfolio-1 :book-1]
@@ -155,17 +176,18 @@
 
 (deftest writes-language-neutral-artifact-header
   (let [bytes (artifact-bytes (csr/dataset->csr-source (test-dataset)))]
-    (is (= [0x53 0x4c 0x43 0x53 0x52 0x00 0x01 0x00
-            0x01 0x00 0x00 0x00
-            0x04 0x03 0x02 0x01]
+    (is (= (concat (mapv #(bit-and (int %) 0xff) (artifact-magic-bytes))
+                   [0x01 0x00 0x00 0x00
+                    0x04 0x03 0x02 0x01])
            (mapv #(bit-and (int %) 0xff) (take 16 bytes))))))
 
 (deftest roundtrips-heap-source-through-mmap-artifact
   (let [heap (csr/dataset->csr-source (test-dataset))]
     (roundtrip-source
      heap
-     (fn [path mmap]
+     (fn [_path mmap]
        (is (= 4 (csr/csr-row-count mmap)))
+       (is (= 2 (csr/csr-col-count mmap)))
        (is (= 5 (csr/csr-entry-count mmap)))
        (is (= 3 (csr/csr-block-dim mmap)))
        (is (= (csr/csr-row-key-at heap 0)
@@ -212,6 +234,22 @@
               (mapv (fn [{:keys [col-key block]}] [col-key block])
                     (collect-source-row mmap 0))))))))
 
+(deftest roundtrips-empty-sources-through-mmap-artifact
+  (let [heap (csr/dataset->csr-source (query-features-compile []))]
+    (roundtrip-source
+     heap
+     (fn [_ mmap]
+       (is (= 0 (csr/csr-row-count mmap)))
+       (is (= 0 (csr/csr-col-count mmap)))
+       (is (= 0 (csr/csr-entry-count mmap)))
+       (is (= 3 (csr/csr-block-dim mmap)))
+       (is (= [{:row-start 0 :row-end 0}]
+              (csr/csr-resolve-ranges mmap nil)))
+       (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo
+            #"out of bounds"
+            (csr/csr-row-span mmap 0)))))))
+
 (deftest resolves-query-shaped-prefix-ranges
   (let [source (-> (test-dataset)
                    csr/dataset->csr-source
@@ -233,7 +271,7 @@
            (csr/csr-resolve-ranges source {:prefix [:book-1]})))))
 
 (deftest delta-row-entries-are-deterministic
-  (let [delta (csr/make-dok-delta)]
+  (let [delta (csr/make-dok-delta 3)]
     (csr/delta-put! delta :r :z [1.0 2.0 3.0])
     (csr/delta-put! delta :r :a [4.0 5.0 6.0])
     (csr/delta-delete! delta :r :m)
@@ -242,7 +280,7 @@
 
 (deftest merged-scan-applies-delta-over-main
   (let [source (csr/dataset->csr-source (test-dataset))
-        delta (csr/make-dok-delta)
+        delta (csr/make-dok-delta-for-source source)
         row-key [:tenant-a :portfolio-1 :book-1]]
     (csr/delta-put! delta row-key :f1 [100.0 101.0 102.0])
     (csr/delta-delete! delta row-key :f2)
@@ -257,7 +295,7 @@
   (let [source (-> (test-dataset)
                    csr/dataset->csr-source
                    (csr/with-range-index identity))
-        delta (csr/make-dok-delta)
+        delta (csr/make-dok-delta-for-source source)
         seen (atom [])]
     (csr/delta-put! delta [:tenant-a :portfolio-1 :book-2] :f2 [20.0 21.0 22.0])
     (csr/scan-merged-ranges!
@@ -274,7 +312,7 @@
 
 (deftest merged-row-id-scan-matches-row-key-scan
   (let [source (csr/dataset->csr-source (test-dataset))
-        delta (csr/make-dok-delta)
+        delta (csr/make-dok-delta-for-source source)
         row-key [:tenant-a :portfolio-1 :book-1]
         by-id (atom [])]
     (csr/delta-put! delta row-key :f2 [30.0 31.0 32.0])
@@ -291,7 +329,7 @@
 
 (deftest merged-scan-includes-delta-only-rows
   (let [source (csr/dataset->csr-source (test-dataset))
-        delta (csr/make-dok-delta)
+        delta (csr/make-dok-delta-for-source source)
         row-key [:tenant-c :portfolio-9 :book-9]]
     (csr/delta-put! delta row-key :f1 [1.0 1.5 2.0])
     (is (= [[-1 row-key :f1 :delta [1.0 1.5 2.0]]]
@@ -299,13 +337,63 @@
                    [row-id row-key col-key origin block])
                  (collect-merged-row source delta row-key))))))
 
+(deftest merged-scans-work-against-mmap-sources
+  (let [heap (csr/dataset->csr-source (test-dataset))]
+    (roundtrip-source
+     heap
+     (fn [_ mmap]
+       (let [delta (csr/make-dok-delta-for-source mmap)
+             row-key [:tenant-a :portfolio-1 :book-1]]
+         (csr/delta-put! delta row-key :f1 [100.0 101.0 102.0])
+         (csr/delta-delete! delta row-key :f2)
+         (csr/delta-put! delta row-key :f3 [200.0 201.0 202.0])
+         (is (= [[:f1 :delta [100.0 101.0 102.0]]
+                 [:f3 :delta [200.0 201.0 202.0]]]
+                (mapv (fn [{:keys [col-key origin block]}]
+                        [col-key origin block])
+                      (collect-merged-row mmap delta row-key)))))))))
+
 (deftest delta-put-copies-input-block
-  (let [delta (csr/make-dok-delta)
+  (let [delta (csr/make-dok-delta 3)
         block (double-array [1.0 2.0 3.0])]
     (csr/delta-put! delta :r :c block)
     (aset block 0 99.0)
     (is (= [1.0 2.0 3.0]
            (vec (seq (:block (csr/delta-entry delta :r :c))))))))
+
+(deftest dimensioned-deltas-reject-wrong-sized-blocks
+  (let [delta (csr/make-dok-delta 3)]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"wrong dimension"
+         (csr/delta-put! delta :r :c [1.0])))))
+
+(deftest sources-reject-out-of-bounds-ids
+  (let [heap (csr/dataset->csr-source (test-dataset))]
+    (doseq [source [heap]]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"out of bounds"
+           (csr/csr-row-span source -1)))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"out of bounds"
+           (csr/csr-entry-col-id source (csr/csr-entry-count source)))))
+    (roundtrip-source
+     heap
+     (fn [_ mmap]
+       (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo
+            #"out of bounds"
+            (csr/csr-row-span mmap -1)))
+       (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo
+            #"out of bounds"
+            (csr/csr-row-span mmap 9)))
+       (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo
+            #"out of bounds"
+            (csr/csr-entry-col-id mmap 9)))))))
 
 (deftest rejects-unsupported-payload-kinds
   (let [ds (scalar-features-compile
@@ -330,8 +418,7 @@
   (let [path (temp-artifact)
         buffer (doto (ByteBuffer/allocate 64)
                  (.order ByteOrder/LITTLE_ENDIAN)
-                 (.put (byte-array [(byte 0x53) (byte 0x4c) (byte 0x43) (byte 0x53)
-                                    (byte 0x52) (byte 0x00) (byte 0x01) (byte 0x00)]))
+                 (.put (artifact-magic-bytes))
                  (.putInt 1)
                  (.putInt 0x01020304)
                  (.putInt 64)
@@ -352,9 +439,46 @@
       (finally
         (Files/deleteIfExists path)))))
 
-(deftest deprecated-mmap-skeleton-points-to-open
-  (is (thrown-with-msg?
-       clojure.lang.ExceptionInfo
-       #"open-csr-artifact"
-       (csr/make-mmap-csr-source-skeleton {:path "future.csr"
-                                           :payload-dim 3}))))
+(deftest rejects-artifacts-with-duplicate-section-ids
+  (let [source (csr/dataset->csr-source (test-dataset))
+        path (corrupt-artifact-path
+              source
+              (fn [buffer]
+                (.putInt buffer (section-entry-offset 2) 1)))]
+    (try
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"duplicate section"
+           (csr/open-csr-artifact path)))
+      (finally
+        (Files/deleteIfExists path)))))
+
+(deftest rejects-artifacts-with-invalid-row-pointers
+  (let [source (csr/dataset->csr-source (test-dataset))
+        path (corrupt-artifact-path
+              source
+              (fn [buffer]
+                (let [row-ptrs-offset (section-offset buffer 1)]
+                  (.putInt buffer (+ row-ptrs-offset (* 4 4)) 4))))]
+    (try
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"final row pointer"
+           (csr/open-csr-artifact path)))
+      (finally
+        (Files/deleteIfExists path)))))
+
+(deftest rejects-artifacts-with-out-of-bounds-column-ids
+  (let [source (csr/dataset->csr-source (test-dataset))
+        path (corrupt-artifact-path
+              source
+              (fn [buffer]
+                (let [col-ids-offset (section-offset buffer 2)]
+                  (.putInt buffer col-ids-offset 99))))]
+    (try
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"column id is out of bounds"
+           (csr/open-csr-artifact path)))
+      (finally
+        (Files/deleteIfExists path)))))

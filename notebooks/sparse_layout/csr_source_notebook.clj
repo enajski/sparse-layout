@@ -287,7 +287,7 @@ acme-core-ranges
 ;; 4. Output remains deterministic by column id.
 
 (def delta
-  (doto (csr/make-dok-delta)
+  (doto (csr/make-dok-delta-for-source source)
     (csr/delta-put! [:acme :core :fx] :risk [0.99 0.95 0.0])
     (csr/delta-delete! [:acme :core :fx] :liquidity)
     (csr/delta-put! [:acme :core :fx] :carry [0.07 0.62 0.0])
@@ -381,11 +381,26 @@ acme-core-ranges
 ;; need only the binary header, the section table, primitive sections, and the
 ;; tagged key dictionary encoding.
 
+(def mmap-artifact-format
+  {:header [:magic :version :endian-marker :header-length
+            :section-count :section-table-offset
+            :row-count :col-count :entry-count :block-dim :flags]
+   :section-table [:section-id :primitive-type :count :byte-offset :byte-length]
+   :sections [:row-ptrs
+              :col-ids
+              :payload-values
+              :row-key-offsets
+              :row-key-bytes
+              :col-key-offsets
+              :col-key-bytes
+              :metadata]
+   :key-tags [:nil :false :true :int64 :float64 :string :keyword :vector]})
+
 (clerk/table
- (mapv (fn [[section fields]]
-         {:artifact-section section
-          :fields fields})
-       csr/mmap-artifact-format-sketch))
+ (mapv (fn [[field value]]
+         {:format-field field
+          :value value})
+       mmap-artifact-format))
 
 ;; ## 9. Takeaway
 ;;
