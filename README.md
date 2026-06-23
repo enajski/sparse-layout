@@ -189,7 +189,16 @@ The `sparse-layout.csr-source` namespace exposes a lower-level storage API for f
 
 For mutable overlays, use `make-dok-delta` and merged scans. Delta puts override main entries, deletes tombstone main entries, and delta-only entries for existing rows appear in deterministic column order.
 
-The first implementation is heap-backed and fixed-double-block-only. `MmapCSRSource` is intentionally a backend skeleton so consumers can depend on the `CSRSource` protocol before the mmap artifact reader exists.
+The source layer can also persist fixed-double-block CSR sources to a language-neutral mmap artifact:
+
+```clojure
+(csr/write-csr-artifact! source "/tmp/features.slcsr")
+(def mmap-source (csr/open-csr-artifact "/tmp/features.slcsr"))
+
+(csr/csr-copy-block! mmap-source 0 out 0)
+```
+
+The v1 artifact is a single little-endian binary file with a fixed header, section table, primitive CSR sections, payload doubles, and typed row/column key dictionaries. Readers rebuild key lookup maps on open while keeping row pointers, column ids, and payload values mmap-backed.
 
 ## Executable Documentation
 

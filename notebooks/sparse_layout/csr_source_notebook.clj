@@ -1,9 +1,10 @@
 (ns sparse-layout.csr-source-notebook
+  {:nextjournal.clerk/no-cache true}
   (:require [nextjournal.clerk :as clerk]
             [sparse-layout.core :refer [block-view-value
-                                        sparse-internals]]
-            [sparse-layout.notebook-data :as demo]
-            [sparse-layout.csr-source :as csr]))
+                                        defsparse]]
+            [sparse-layout.csr-source :as csr])
+  (:import [java.nio.file Paths]))
 
 ;; # sparse-layout: from logical records to query-shaped CSR
 ;;
@@ -18,9 +19,7 @@
 
 (clerk/html
  [:div {:style {:padding "1.1rem 1.25rem"
-                :border "1px solid #d8dee9"
-                :border-radius "8px"
-                :background "#f8fafc"}}
+                :border-radius "8px"}}
   [:h3 {:style {:margin "0 0 .35rem"}} "What this notebook demonstrates"]
   [:ol {:style {:margin "0"
                 :padding-left "1.25rem"}}
@@ -49,17 +48,60 @@
 ;; The rows below are intentionally ordered by `[tenant portfolio book]`.
 ;; That order is what later makes prefix ranges cheap to resolve.
 
-(clerk/table demo/records)
+(def ^:nextjournal.clerk/no-cache demo-state
+  (do
+    (eval
+     '(defsparse portfolio-eval-features
+        {:row-key [:row]
+         :cols-path [:features]
+         :payload {:kind :fixed-double-block
+                   :dim 3}
+         :indices #{:csr :csc}}))
+    (let [records [{:row [:acme :core :fx]
+                    :features (array-map :exposure [12.0 0.91 1.0]
+                                         :risk [0.42 0.78 1.0]
+                                         :liquidity [0.88 0.83 1.0])}
+                   {:row [:acme :core :rates]
+                    :features (array-map :exposure [8.0 0.86 2.0]
+                                         :risk [0.31 0.74 2.0])}
+                   {:row [:acme :growth :equity]
+                    :features (array-map :exposure [19.0 0.88 1.0]
+                                         :momentum [1.12 0.67 3.0])}
+                   {:row [:globex :core :fx]
+                    :features (array-map :exposure [15.0 0.89 1.0]
+                                         :liquidity [0.73 0.70 2.0])}
+                   {:row [:globex :income :credit]
+                    :features (array-map :risk [0.57 0.81 1.0]
+                                         :carry [0.19 0.76 2.0])}]
+          compile! @(requiring-resolve
+                     'sparse-layout.csr-source-notebook/portfolio-eval-features-compile)
+          row-value @(requiring-resolve
+                      'sparse-layout.csr-source-notebook/portfolio-eval-features-row)
+          block-view @(requiring-resolve
+                       'sparse-layout.csr-source-notebook/portfolio-eval-features-block-view)
+          dataset (compile! records)]
+      {:records records
+       :dataset dataset
+       :sample-row (row-value dataset [:acme :core :fx])
+       :exposure-view (block-view dataset [:acme :core :fx] :exposure)
+       :source (csr/dataset->csr-source dataset)})))
+
+(def records (:records demo-state))
+
+(def dataset (:dataset demo-state))
+
+(clerk/table records)
 
 ;; ## 2. The generated API stays ergonomic
 ;;
 ;; Existing callers can keep using the generated row, column, point, and view
 ;; APIs. The new source layer is additive.
 
-(demo/portfolio-features-row demo/dataset [:acme :core :fx])
+(def sample-row (:sample-row demo-state))
 
-(def exposure-view
-  (demo/portfolio-features-block-view demo/dataset [:acme :core :fx] :exposure))
+sample-row
+
+(def exposure-view (:exposure-view demo-state))
 
 [(block-view-value exposure-view 0)
  (block-view-value exposure-view 1)
@@ -67,20 +109,18 @@
 
 ;; ## 3. The frozen shape is compact CSR plus dictionaries
 ;;
-;; The generated dataset exposes internals for adapters. The important CSR
-;; fields are row pointers, column ids, and one contiguous fixed-double-block
-;; payload array.
+;; The source adapter exposes the important CSR facts without exposing generated
+;; dataset classes to hot consumers.
 
-(def internals
-  (sparse-internals demo/dataset))
+(def source (:source demo-state))
 
 (def physical-summary
-  {:rows (alength ^objects (:id->row internals))
-   :cols (alength ^objects (:id->col internals))
-   :entries (alength ^ints (:csr-col-ids internals))
-   :payload-kind (:payload-kind internals)
-   :block-dim (:payload-dim internals)
-   :payload-doubles (alength ^doubles (:payload-values internals))})
+  {:rows (csr/csr-row-count source)
+   :entries (csr/csr-entry-count source)
+   :payload-kind :fixed-double-block
+   :block-dim (csr/csr-block-dim source)
+   :payload-doubles (* (csr/csr-entry-count source)
+                       (csr/csr-block-dim source))})
 
 (clerk/table [physical-summary])
 
@@ -90,31 +130,59 @@
 ;; block copies; they do not need to know whether the backing store is a heap
 ;; array today or an mmap artifact later.
 
-(def source
-  (csr/dataset->csr-source demo/dataset))
+(defn block-values
+  [^doubles blocks block-dim offset]
+  (mapv (fn [j]
+          (aget blocks (+ offset j)))
+        (range block-dim)))
 
-(defn copy-block
-  [source entry-id]
-  (let [out (double-array (csr/csr-block-dim source))]
-    (csr/csr-copy-block! source entry-id out 0)
-    (vec (seq out))))
+(defn materialized-scan->table
+  [{:keys [source rows row-keys cols col-keys entries origins blocks count]}]
+  (let [block-dim (csr/csr-block-dim source)]
+    (mapv (fn [i]
+            (let [row-id (aget ^ints rows i)
+                  col-id (aget ^ints cols i)]
+              (cond-> {:row-id row-id
+                       :row-key (if row-keys
+                                  (aget ^objects row-keys i)
+                                  (when-not (neg? row-id)
+                                    (csr/csr-row-key-at source row-id)))
+                       :entry-id (aget ^ints entries i)
+                       :col-id col-id
+                       :col-key (if col-keys
+                                  (aget ^objects col-keys i)
+                                  (csr/csr-col-key-at source col-id))
+                       :block (block-values blocks block-dim (* i block-dim))}
+                origins (assoc :origin (aget ^objects origins i)))))
+          (range count))))
 
-(defn source-row
+(defn materialize-source-row
   [source row-id]
-  (let [row-key (csr/csr-row-key-at source row-id)
-        seen (atom [])]
+  (let [[start end] (csr/csr-row-span source row-id)
+        entry-count (- end start)
+        block-dim (csr/csr-block-dim source)
+        rows (int-array entry-count)
+        cols (int-array entry-count)
+        entries (int-array entry-count)
+        blocks (double-array (* entry-count block-dim))
+        cursor (int-array 1)]
     (csr/csr-scan-row!
      source
      row-id
      (fn [row-id* col-id entry-id src]
-       (swap! seen conj
-              {:row-id row-id*
-               :row-key row-key
-               :entry-id entry-id
-               :col-id col-id
-               :col-key (csr/csr-col-key-at src col-id)
-               :block (copy-block src entry-id)})))
-    @seen))
+       (let [i (aget cursor 0)
+             block-off (* i block-dim)]
+         (aset-int rows i row-id*)
+         (aset-int cols i col-id)
+         (aset-int entries i entry-id)
+         (csr/csr-copy-block! src entry-id blocks block-off)
+         (aset-int cursor 0 (inc i)))))
+    {:source source
+     :rows rows
+     :cols cols
+     :entries entries
+     :blocks blocks
+     :count (aget cursor 0)}))
 
 (def row-catalog
   (mapv (fn [row-id]
@@ -128,10 +196,14 @@
 
 (clerk/table row-catalog)
 
-;; Scan one row through the storage-level API. Notice that payloads are copied
-;; into a caller-owned `double[]` by `csr-copy-block!`.
+;; Scan one row through the storage-level API. The visitor writes ids into
+;; preallocated `int[]` arrays and copies payloads into one caller-owned
+;; contiguous `double[]`.
 
-(clerk/table (source-row source 0))
+(def row-0-scan
+  (materialize-source-row source 0))
+
+(clerk/table (materialized-scan->table row-0-scan))
 
 ;; ## 5. Query-shaped row ranges
 ;;
@@ -147,21 +219,53 @@
 
 acme-core-ranges
 
-(defn scan-ranges
+(defn range-entry-count
   [source ranges]
-  (let [seen (atom [])]
+  (reduce (fn [n row-range]
+            (let [[row-start row-end] ((fn [r]
+                                         (cond
+                                           (map? r) [(:row-start r) (:row-end r)]
+                                           :else r))
+                                       row-range)]
+              (+ n
+                 (reduce (fn [row-n row-id]
+                           (let [[start end] (csr/csr-row-span source row-id)]
+                             (+ row-n (- end start))))
+                         0
+                         (range row-start row-end)))))
+          0
+          ranges))
+
+(defn materialize-ranges
+  [source ranges]
+  (let [entry-count (range-entry-count source ranges)
+        block-dim (csr/csr-block-dim source)
+        rows (int-array entry-count)
+        cols (int-array entry-count)
+        entries (int-array entry-count)
+        blocks (double-array (* entry-count block-dim))
+        cursor (int-array 1)]
     (csr/csr-scan-ranges!
      source
      ranges
      (fn [row-id col-id entry-id src]
-       (swap! seen conj
-              {:row-key (csr/csr-row-key-at src row-id)
-               :col-key (csr/csr-col-key-at src col-id)
-               :entry-id entry-id
-               :block (copy-block src entry-id)})))
-    @seen))
+       (let [i (aget cursor 0)
+             block-off (* i block-dim)]
+         (aset-int rows i row-id)
+         (aset-int cols i col-id)
+         (aset-int entries i entry-id)
+         (csr/csr-copy-block! src entry-id blocks block-off)
+         (aset-int cursor 0 (inc i)))))
+    {:source source
+     :rows rows
+     :cols cols
+     :entries entries
+     :blocks blocks
+     :count (aget cursor 0)}))
 
-(clerk/table (scan-ranges ranged-source acme-core-ranges))
+(clerk/table
+ (materialized-scan->table
+  (materialize-ranges ranged-source acme-core-ranges)))
 
 ;; Non-contiguous projections are still correct. This projection indexes only
 ;; the book segment, so `:fx` appears under both tenants and returns two ranges.
@@ -189,38 +293,93 @@ acme-core-ranges
     (csr/delta-put! [:acme :core :fx] :carry [0.07 0.62 0.0])
     (csr/delta-put! [:initech :special :synthetic] :risk [0.66 0.55 0.0])))
 
-(defn merged-row
+(defn merged-row-capacity
   [source delta row-key]
-  (let [seen (atom [])]
+  (+ (let [row-id (csr/csr-row-id source row-key)]
+       (if (neg? row-id)
+         0
+         (let [[start end] (csr/csr-row-span source row-id)]
+           (- end start))))
+     (count (csr/delta-row-entries delta row-key))))
+
+(defn materialize-merged-row
+  [source delta row-key]
+  (let [entry-capacity (merged-row-capacity source delta row-key)
+        block-dim (csr/csr-block-dim source)
+        rows (int-array entry-capacity)
+        cols (int-array entry-capacity)
+        entries (int-array entry-capacity)
+        row-keys (object-array entry-capacity)
+        col-keys (object-array entry-capacity)
+        origins (object-array entry-capacity)
+        blocks (double-array (* entry-capacity block-dim))
+        cursor (int-array 1)]
     (csr/scan-merged-row!
      source
      delta
      row-key
      (fn [row-id row-key* col-id col-key origin entry-id block]
-       (swap! seen conj
-              {:row-id row-id
-               :row-key row-key*
-               :col-id col-id
-               :col-key col-key
-               :origin origin
-               :entry-id entry-id
-               :block (if (= :main origin)
-                        (copy-block source entry-id)
-                        (vec (seq block)))})))
-    @seen))
+       (let [i (aget cursor 0)
+             block-off (* i block-dim)]
+         (aset-int rows i row-id)
+         (aset-int cols i col-id)
+         (aset-int entries i entry-id)
+         (aset row-keys i row-key*)
+         (aset col-keys i col-key)
+         (aset origins i origin)
+         (if (= :main origin)
+           (csr/csr-copy-block! source entry-id blocks block-off)
+           (System/arraycopy ^doubles block 0 blocks block-off block-dim))
+         (aset-int cursor 0 (inc i)))))
+    {:source source
+     :rows rows
+     :row-keys row-keys
+     :cols cols
+     :col-keys col-keys
+     :entries entries
+     :origins origins
+     :blocks blocks
+     :count (aget cursor 0)}))
 
-(clerk/table (merged-row source delta [:acme :core :fx]))
+(clerk/table
+ (materialized-scan->table
+  (materialize-merged-row source delta [:acme :core :fx])))
 
 ;; Delta-only rows are supported too. They use row id `-1` because they are not
 ;; yet present in the immutable main CSR.
 
-(clerk/table (merged-row source delta [:initech :special :synthetic]))
+(clerk/table
+ (materialized-scan->table
+  (materialize-merged-row source delta [:initech :special :synthetic])))
 
-;; ## 7. What mmap needs to preserve
+;; ## 7. Persist and reopen as a language-neutral mmap artifact
 ;;
-;; The future mmap backend can use a different physical store as long as it
-;; satisfies the same CSRSource operations. The current code captures the
-;; intended artifact sections as data.
+;; The artifact writer accepts any `CSRSource`, not just generated datasets. The
+;; file is a single little-endian binary artifact with a header, section table,
+;; primitive CSR sections, payload doubles, and typed row/column key
+;; dictionaries.
+
+(def artifact-path
+  (Paths/get "/tmp/sparse-layout-demo.slcsr" (make-array String 0)))
+
+(csr/write-csr-artifact! source artifact-path)
+
+(def mmap-source
+  (csr/open-csr-artifact artifact-path))
+
+(clerk/table
+ [(select-keys (csr/csr-artifact-metadata mmap-source)
+               [:row-count :col-count :entry-count :block-dim])])
+
+(clerk/table
+ (materialized-scan->table
+  (materialize-source-row mmap-source 0)))
+
+;; ## 8. What mmap needs to preserve
+;;
+;; Other languages do not need Clojure internals to read the core layout. They
+;; need only the binary header, the section table, primitive sections, and the
+;; tagged key dictionary encoding.
 
 (clerk/table
  (mapv (fn [[section fields]]
@@ -228,7 +387,7 @@ acme-core-ranges
           :fields fields})
        csr/mmap-artifact-format-sketch))
 
-;; ## 8. Takeaway
+;; ## 9. Takeaway
 ;;
 ;; `sparse-layout` is moving toward a physical layout compiler:
 ;;
@@ -236,6 +395,7 @@ acme-core-ranges
 ;; - Freeze compiles nested data into dictionary-encoded primitive arrays.
 ;; - `CSRSource` decouples hot readers from generated dataset types.
 ;; - Range indexes encode query shape without changing the public dataset API.
+;; - Mmap artifacts make the physical layout durable and language-neutral.
 ;; - Deltas make mutable overlays possible while preserving immutable main
 ;;   storage.
 
@@ -247,11 +407,8 @@ acme-core-ranges
                        ["Entries" (csr/csr-entry-count source)]
                        ["Block dim" (csr/csr-block-dim source)]]]
     [:div {:style {:padding "1rem"
-                   :border "1px solid #d8dee9"
-                   :border-radius "8px"
-                   :background "#ffffff"}}
+                   :border-radius "8px"}}
      [:div {:style {:font-size ".8rem"
-                    :color "#64748b"
                     :text-transform "uppercase"}}
       label]
      [:div {:style {:font-size "1.8rem"

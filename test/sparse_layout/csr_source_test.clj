@@ -1,7 +1,9 @@
 (ns sparse-layout.csr-source-test
   (:require [clojure.test :refer [deftest is testing]]
             [sparse-layout.core :refer [defsparse]]
-            [sparse-layout.csr-source :as csr]))
+            [sparse-layout.csr-source :as csr])
+  (:import [java.nio ByteBuffer ByteOrder]
+           [java.nio.file Files Path StandardOpenOption]))
 
 (defsparse query-features
   {:row-key [:row]
@@ -15,6 +17,30 @@
    :cols-path [:vals]
    :payload :double
    :indices #{:csr}})
+
+(defsparse typed-key-features
+  {:row-key [:row]
+   :cols-path [:vals]
+   :payload {:kind :fixed-double-block
+             :dim 2}
+   :indices #{:csr}})
+
+(deftype FieldOnlyDataset
+  [rowToId
+   idToRow
+   colToId
+   idToCol
+   edgeRows
+   edgeCols
+   csrRowPtrs
+   csrColIds
+   cscColPtrs
+   cscRowIds
+   cscPayloadIds
+   payloadKind
+   payloadDim
+   payloadValues
+   payloadPtrs])
 
 (defn- test-dataset []
   (query-features-compile
@@ -62,6 +88,26 @@
                                   (vec (seq block)))})))
     @seen))
 
+(defn- temp-artifact ^Path []
+  (Files/createTempFile "sparse-layout-csr-" ".slcsr"
+                        (make-array java.nio.file.attribute.FileAttribute 0)))
+
+(defn- artifact-bytes [source]
+  (let [path (temp-artifact)]
+    (try
+      (csr/write-csr-artifact! source path)
+      (Files/readAllBytes path)
+      (finally
+        (Files/deleteIfExists path)))))
+
+(defn- roundtrip-source [source f]
+  (let [path (temp-artifact)]
+    (try
+      (csr/write-csr-artifact! source path)
+      (f path (csr/open-csr-artifact path))
+      (finally
+        (Files/deleteIfExists path)))))
+
 (deftest adapts-fixed-double-block-dataset-to-heap-csr-source
   (let [source (csr/dataset->csr-source (test-dataset))]
     (is (= 4 (csr/csr-row-count source)))
@@ -75,12 +121,96 @@
            (mapv (fn [{:keys [col-key block]}] [col-key block])
                  (collect-source-row source 0))))))
 
+(deftest adapts-generated-field-shape-when-protocol-identity-is-stale
+  (let [ds (test-dataset)
+        internals (sparse-layout.core/sparse-internals ds)
+        field-only (->FieldOnlyDataset (:row->id internals)
+                                       (:id->row internals)
+                                       (:col->id internals)
+                                       (:id->col internals)
+                                       (:edge-rows internals)
+                                       (:edge-cols internals)
+                                       (:csr-row-ptrs internals)
+                                       (:csr-col-ids internals)
+                                       (:csc-col-ptrs internals)
+                                       (:csc-row-ids internals)
+                                       (:csc-payload-ids internals)
+                                       (:payload-kind internals)
+                                       (:payload-dim internals)
+                                       (:payload-values internals)
+                                       (:payload-ptrs internals))
+        source (csr/dataset->csr-source field-only)]
+    (is (= 4 (csr/csr-row-count source)))
+    (is (= 5 (csr/csr-entry-count source)))
+    (is (= [:tenant-a :portfolio-1 :book-1]
+           (csr/csr-row-key-at source 0)))
+    (is (= [1.0 2.0 3.0] (copied-block source 0)))))
+
 (deftest copies-blocks-into-caller-owned-buffer
   (let [source (csr/dataset->csr-source (test-dataset))
         out (double-array 5)]
     (csr/csr-copy-block! source 1 out 2)
     (is (= [0.0 0.0 4.0 5.0 6.0]
            (vec (seq out))))))
+
+(deftest writes-language-neutral-artifact-header
+  (let [bytes (artifact-bytes (csr/dataset->csr-source (test-dataset)))]
+    (is (= [0x53 0x4c 0x43 0x53 0x52 0x00 0x01 0x00
+            0x01 0x00 0x00 0x00
+            0x04 0x03 0x02 0x01]
+           (mapv #(bit-and (int %) 0xff) (take 16 bytes))))))
+
+(deftest roundtrips-heap-source-through-mmap-artifact
+  (let [heap (csr/dataset->csr-source (test-dataset))]
+    (roundtrip-source
+     heap
+     (fn [path mmap]
+       (is (= 4 (csr/csr-row-count mmap)))
+       (is (= 5 (csr/csr-entry-count mmap)))
+       (is (= 3 (csr/csr-block-dim mmap)))
+       (is (= (csr/csr-row-key-at heap 0)
+              (csr/csr-row-key-at mmap 0)))
+       (is (= (csr/csr-row-id heap [:tenant-a :portfolio-1 :book-1])
+              (csr/csr-row-id mmap [:tenant-a :portfolio-1 :book-1])))
+       (is (= (csr/csr-col-id heap :f2)
+              (csr/csr-col-id mmap :f2)))
+       (is (= (csr/csr-row-span heap 0)
+              (csr/csr-row-span mmap 0)))
+       (is (= (collect-source-row heap 0)
+              (collect-source-row mmap 0)))
+       (is (= {:row-count 4
+               :col-count 2
+               :entry-count 5
+               :block-dim 3}
+              (select-keys (csr/csr-artifact-metadata mmap)
+                           [:row-count :col-count :entry-count :block-dim])))
+       (is (= [{:row-start 0 :row-end 2}]
+              (csr/csr-resolve-ranges
+               (csr/with-range-index mmap identity)
+               {:prefix [:tenant-a :portfolio-1]})))))))
+
+(deftest roundtrips-typed-business-keys
+  (let [row-key [nil false true 42 3.25 "desk" :tenant/acme]
+        col-key [:factor 7]
+        heap (csr/dataset->csr-source
+              (typed-key-features-compile
+               [{:row row-key
+                 :vals (array-map "exposure" [1.0 2.0]
+                                  :risk [3.0 4.0]
+                                  col-key [5.0 6.0])}]))]
+    (roundtrip-source
+     heap
+     (fn [_ mmap]
+       (is (= row-key (csr/csr-row-key-at mmap 0)))
+       (is (= 0 (csr/csr-row-id mmap row-key)))
+       (is (= "exposure" (csr/csr-col-key-at mmap 0)))
+       (is (= col-key (csr/csr-col-key-at mmap 2)))
+       (is (= 2 (csr/csr-col-id mmap col-key)))
+       (is (= [["exposure" [1.0 2.0]]
+               [:risk [3.0 4.0]]
+               [col-key [5.0 6.0]]]
+              (mapv (fn [{:keys [col-key block]}] [col-key block])
+                    (collect-source-row mmap 0))))))))
 
 (deftest resolves-query-shaped-prefix-ranges
   (let [source (-> (test-dataset)
@@ -185,18 +315,46 @@
          #"fixed double block"
          (csr/dataset->csr-source ds)))))
 
-(deftest mmap-skeleton-validates-minimal-shape
-  (is (= 3
-         (csr/csr-block-dim
-          (csr/make-mmap-csr-source-skeleton
-           {:path "future.csr"
-            :payload-dim 3}))))
+(deftest rejects-invalid-artifact-magic
+  (let [path (temp-artifact)]
+    (try
+      (Files/write path (byte-array 64) (make-array StandardOpenOption 0))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"magic"
+           (csr/open-csr-artifact path)))
+      (finally
+        (Files/deleteIfExists path)))))
+
+(deftest rejects-artifacts-missing-required-sections
+  (let [path (temp-artifact)
+        buffer (doto (ByteBuffer/allocate 64)
+                 (.order ByteOrder/LITTLE_ENDIAN)
+                 (.put (byte-array [(byte 0x53) (byte 0x4c) (byte 0x43) (byte 0x53)
+                                    (byte 0x52) (byte 0x00) (byte 0x01) (byte 0x00)]))
+                 (.putInt 1)
+                 (.putInt 0x01020304)
+                 (.putInt 64)
+                 (.putInt 0)
+                 (.putLong 64)
+                 (.putLong 0)
+                 (.putLong 0)
+                 (.putLong 0)
+                 (.putInt 1)
+                 (.putInt 0)
+                 (.flip))]
+    (try
+      (Files/write path (.array buffer) (make-array StandardOpenOption 0))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"missing a required section"
+           (csr/open-csr-artifact path)))
+      (finally
+        (Files/deleteIfExists path)))))
+
+(deftest deprecated-mmap-skeleton-points-to-open
   (is (thrown-with-msg?
        clojure.lang.ExceptionInfo
-       #"requires a path"
-       (csr/make-mmap-csr-source-skeleton {:payload-dim 3})))
-  (is (thrown-with-msg?
-       clojure.lang.ExceptionInfo
-       #"positive fixed block dimension"
+       #"open-csr-artifact"
        (csr/make-mmap-csr-source-skeleton {:path "future.csr"
-                                           :payload-dim 0}))))
+                                           :payload-dim 3}))))
