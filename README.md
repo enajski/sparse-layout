@@ -312,13 +312,18 @@ To analyze changes and check obligations:
 bb bridge next
 ```
 
-`deps.edn` includes a test alias:
+`deps.edn` includes test, lint, and advanced-format aliases:
 
 ```sh
 clojure -M:test
+clojure -M:lint
+clojure -M:format
+clojure -M:format check
 ```
 
-Use `bb bridge run-evidence --id unit` or just `bb bridge auto` to run all tests and update evidences.
+Use `bb bridge run-evidence --id unit`, `bb bridge run-evidence --id lint`, and
+`bb bridge run-evidence --id format`, or just `bb bridge auto`, to refresh
+required evidence.
 
 It also includes a Criterium benchmark alias:
 

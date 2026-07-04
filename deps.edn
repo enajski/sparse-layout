@@ -2,6 +2,14 @@
  :aliases
  {:test {:extra-paths ["test"]
          :main-opts ["-e" "(do (require 'clojure.test 'sparse-layout.core-test 'sparse-layout.facade-test 'sparse-layout.csr-source-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.core-test 'sparse-layout.facade-test 'sparse-layout.csr-source-test)] (when (pos? (+ fail error)) (System/exit 1))))"]}
+  :lint {:extra-deps {io.github.enajski/codestyle
+                      {:git/url "https://github.com/enajski/codestyle.git"
+                       :git/sha "658ee7f67a91dbe3f08c10b68d7c9f4107cb6a4f"}}
+         :main-opts ["-m" "codestyle.lint" "src" "test" "bench" "notebooks" ".clj-kondo/hooks"]}
+  :format {:extra-deps {io.github.enajski/codestyle
+                        {:git/url "https://github.com/enajski/codestyle.git"
+                         :git/sha "658ee7f67a91dbe3f08c10b68d7c9f4107cb6a4f"}}
+           :main-opts ["-m" "codestyle.advanced-format" "src" "test" "bench" "notebooks" ".clj-kondo/hooks"]}
   :clerk {:extra-paths ["notebooks"]
           :extra-deps {io.github.nextjournal/clerk {:mvn/version "0.18.1158"}}
           :exec-fn nextjournal.clerk/serve!

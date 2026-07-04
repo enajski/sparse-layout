@@ -1,0 +1,3 @@
+{:hooks
+ {:analyze-call
+  {sparse-layout.core/defsparse hooks.sparse-layout.core/defsparse}}}

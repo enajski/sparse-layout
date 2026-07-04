@@ -1,0 +1,74 @@
+subsystems:
+- name: core
+  code-globs:
+  - src/**/*
+  docs-globs:
+  - docs/**/*
+  test-globs:
+  - test/**/*
+  expected-artifacts:
+  - change-intent-card
+  - verification-brief
+  - completeness-ledger
+  expected-evidence:
+  - unit-tests
+  - lint
+  - format
+  system-category: api
+  risk-class: medium
+project-name: sparse-layout
+artifact-paths:
+  root: .bridge/ephemeral
+  phases: .bridge/ephemeral/phases
+  evidence: .bridge/ephemeral/evidence
+  evaluations: .bridge/ephemeral/evaluations
+test-paths:
+- test
+docs-paths:
+- docs
+phases: []
+kind: project-profile
+verification-policy-path: .bridge/verification-policy.yaml
+code-paths:
+- src
+root-path: ..
+canonical-commands:
+- id: unit
+  kind: unit
+  role: regression
+  command: |
+    clojure -M:test 1>&2
+    status=$?
+    if [ "$status" -eq 0 ]; then
+      printf '\n{:evidence-status "passed"}\n'
+    else
+      printf '\n{:evidence-status "failed" :failure-signals ["clojure -M:test exited nonzero"]}\n'
+    fi
+    exit "$status"
+  description: Run unit tests
+- id: lint
+  kind: lint
+  role: regression
+  command: |
+    clojure -M:lint 1>&2
+    status=$?
+    if [ "$status" -eq 0 ]; then
+      printf '\n{:evidence-status "passed"}\n'
+    else
+      printf '\n{:evidence-status "failed" :failure-signals ["clojure -M:lint exited nonzero"]}\n'
+    fi
+    exit "$status"
+  description: Run clj-kondo via codestyle.lint
+- id: format
+  kind: format
+  role: regression
+  command: |
+    clojure -M:format check 1>&2
+    status=$?
+    if [ "$status" -eq 0 ]; then
+      printf '\n{:evidence-status "passed"}\n'
+    else
+      printf '\n{:evidence-status "failed" :failure-signals ["clojure -M:format check exited nonzero"]}\n'
+    fi
+    exit "$status"
+  description: Check advanced formatting via codestyle.advanced-format
