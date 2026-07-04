@@ -194,7 +194,7 @@ sources reject out-of-range ids instead of reading arbitrary storage.
 ;; => [{:row-start 0 :row-end 42}]
 ```
 
-For mutable overlays, use `make-dok-delta-for-source` and merged scans:
+For mutable overlays, use `make-dok-delta-for-source` and an overlay view:
 
 ```clojure
 (def delta (csr/make-dok-delta-for-source source))
@@ -202,10 +202,13 @@ For mutable overlays, use `make-dok-delta-for-source` and merged scans:
 (csr/delta-put! delta :row-a :col-b [1.0 2.0 3.0])
 (csr/delta-delete! delta :row-a :col-c)
 
-(csr/scan-merged-row! source delta :row-a visitor)
+(def view (csr/overlay-view ranged-source delta))
+
+(csr/scan-overlay-row! view :row-a visitor)
+(csr/scan-overlay-selection! view {:prefix [:tenant-a :portfolio-1]} visitor)
 ```
 
-Delta puts override main entries, deletes tombstone main entries, and delta-only entries for existing rows appear in deterministic column order. Use `make-dok-delta` directly only when you already have an explicit block dimension. Dimensioned deltas reject blocks whose length does not match the source block dimension.
+Delta puts override main entries, deletes tombstone main entries, and delta-only rows with visible puts appear in logical overlay selections. Prefix overlay selections require a source prepared with `with-range-index`, so the view can reuse the same row projection for base and delta-only rows. Numeric merged range scans remain base-row-id scans and do not discover delta-only rows; use `scan-overlay-selection!` for user-facing mutable views. Use `make-dok-delta` directly only when you already have an explicit block dimension. Dimensioned deltas reject blocks whose length does not match the source block dimension.
 
 The source layer can also persist fixed-double-block CSR sources to a language-neutral mmap artifact:
 

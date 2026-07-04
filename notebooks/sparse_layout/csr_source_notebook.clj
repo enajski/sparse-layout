@@ -27,7 +27,7 @@
    [:li "Adapt the frozen dataset to the lower-level CSRSource protocol."]
    [:li "Resolve query prefixes into row ranges."]
    [:li "Overlay a mutable DOK delta on top of immutable CSR."]
-   [:li "Scan merged rows in deterministic column order."]]])
+   [:li "Scan logical overlay selections including delta-only rows."]]])
 
 ;; ## 1. Declare a sparse physical shape
 ;;
@@ -279,11 +279,11 @@ acme-core-ranges
 ;; ## 6. Mutable delta over immutable CSR
 ;;
 ;; The DOK delta records puts and deletes without rewriting the main CSR. During
-;; merged scans:
+;; overlay scans:
 ;;
 ;; 1. A delta put overrides the main coordinate.
 ;; 2. A delta delete suppresses the main coordinate.
-;; 3. Delta-only coordinates are emitted.
+;; 3. Delta-only rows with visible puts are emitted by logical selections.
 ;; 4. Output remains deterministic by column id.
 
 (def delta
@@ -352,6 +352,43 @@ acme-core-ranges
  (materialized-scan->table
   (materialize-merged-row source delta [:initech :special :synthetic])))
 
+(def overlay
+  (csr/overlay-view ranged-source delta))
+
+(defn copied-block-values
+  [source entry-id]
+  (let [out (double-array (csr/csr-block-dim source))]
+    (csr/csr-copy-block! source entry-id out 0)
+    (vec (seq out))))
+
+(defn collect-overlay-selection
+  [source overlay selection]
+  (let [seen (atom [])]
+    (csr/scan-overlay-selection!
+     overlay
+     selection
+     (fn [row-id row-key col-id col-key origin entry-id block]
+       (swap! seen conj
+              {:row-id row-id
+               :row-key row-key
+               :col-id col-id
+               :col-key col-key
+               :origin origin
+               :entry-id entry-id
+               :block (if (= :main origin)
+                        (copied-block-values source entry-id)
+                        (vec (seq block)))})))
+    @seen))
+
+;; Prefix overlay scans reuse the range index for base rows, then append matching
+;; visible delta-only rows. Numeric merged range scans remain base-row-id scans.
+
+(clerk/table
+ (collect-overlay-selection
+  ranged-source
+  overlay
+  {:prefix [:initech :special]}))
+
 ;; ## 7. Persist and reopen as a language-neutral mmap artifact
 ;;
 ;; The artifact writer accepts any `CSRSource`, not just generated datasets. The
@@ -411,8 +448,8 @@ acme-core-ranges
 ;; - `CSRSource` decouples hot readers from generated dataset types.
 ;; - Range indexes encode query shape without changing the public dataset API.
 ;; - Mmap artifacts make the physical layout durable and language-neutral.
-;; - Deltas make mutable overlays possible while preserving immutable main
-;;   storage.
+;; - Overlay views make mutable deltas visible without pretending they are
+;;   stable CSR sources.
 
 (clerk/html
  [:div {:style {:display "grid"

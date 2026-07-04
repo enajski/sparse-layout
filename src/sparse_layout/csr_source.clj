@@ -300,7 +300,8 @@
 
 (deftype DokDelta
          [^HashMap rows
-          blockDim]
+          blockDim
+          ^:unsynchronized-mutable ^long version]
   MutableSparseDelta
   (delta-put! [this row-key col-key block]
     (let [^HashMap row (or (.get rows row-key)
@@ -311,6 +312,7 @@
                          :row-key row-key
                          :col-key col-key
                          :block (copy-block block blockDim)})
+      (set! version (inc version))
       this))
   (delta-delete! [this row-key col-key]
     (let [^HashMap row (or (.get rows row-key)
@@ -320,7 +322,10 @@
       (.put row col-key {:op :delete
                          :row-key row-key
                          :col-key col-key})
+      (set! version (inc version))
       this))
+  (delta-row-keys [_]
+    (vec (keys rows)))
   (delta-row-entries [_ row-key]
     (if-let [row ^HashMap (.get rows row-key)]
       (->> (vals row)
@@ -333,10 +338,13 @@
       (.get row col-key)))
   (delta-clear! [this]
     (.clear rows)
-    this))
+    (set! version (inc version))
+    this)
+  (delta-version [_]
+    version))
 
 (defn make-dok-delta [block-dim]
-  (->DokDelta (HashMap.) (normalize-block-dim block-dim)))
+  (->DokDelta (HashMap.) (normalize-block-dim block-dim) 0))
 
 (defn make-dok-delta-for-source [source]
   (make-dok-delta (p/csr-block-dim source)))
@@ -444,6 +452,145 @@
           (recur (inc row-id))))))
   nil)
 
+(defn- source-prefix-fn [source]
+  (cond
+    (instance? HeapCSRSource source)
+    (.-prefixFn ^HeapCSRSource source)
+
+    (artifact/mmap-csr-source? source)
+    (artifact/mmap-prefix-fn source)
+
+    :else nil))
+
+(defn- require-prefix-fn! [source selection]
+  (or (source-prefix-fn source)
+      (throw (ex-info "Overlay prefix scans require a CSRSource prepared with with-range-index."
+                      {:selection selection
+                       :source-class (class source)}))))
+
+(defn- visible-delta-only-row? [source delta row-key]
+  (and (neg? (p/csr-row-id source row-key))
+       (some #(= :put (:op %))
+             (p/delta-row-entries delta row-key))))
+
+(defn- row-sort-key [prefix-fn row-key]
+  [(if prefix-fn (pr-str (prefix-fn row-key)) "")
+   (pr-str row-key)])
+
+(defn- sorted-visible-delta-only-row-keys [source delta prefix-fn]
+  (->> (p/delta-row-keys delta)
+       (filter #(visible-delta-only-row? source delta %))
+       (sort-by #(row-sort-key prefix-fn %))
+       vec))
+
+(defn- build-delta-prefix-index [source delta prefix-fn]
+  (let [acc (HashMap.)]
+    (doseq [row-key (sorted-visible-delta-only-row-keys source delta prefix-fn)]
+      (doseq [prefix (prefixes (prefix-fn row-key))]
+        (let [rows (or (.get acc prefix) [])]
+          (.put acc prefix (conj rows row-key)))))
+    (into {} acc)))
+
+(defrecord OverlayCSRView [source delta cache])
+
+(defn overlay-view
+  "Returns a logical view of source with delta overlaid.
+
+  Overlay views are not CSRSource implementations: delta-only rows do not have
+  stable CSR row ids. Scan visitors receive row-id -1 for delta-only rows."
+  [source delta]
+  (->OverlayCSRView source delta (volatile! {:version -1
+                                             :prefix-index nil})))
+
+(defn- overlay-prefix-index! [^OverlayCSRView view prefix-fn]
+  (let [source (:source view)
+        delta (:delta view)
+        cache (:cache view)
+        version (p/delta-version delta)
+        snapshot @cache]
+    (when (or (nil? (:prefix-index snapshot))
+              (not= version (:version snapshot)))
+      (vreset! cache {:version version
+                      :prefix-index (build-delta-prefix-index source delta prefix-fn)}))
+    (:prefix-index @cache)))
+
+(defn- scan-delta-only-rows! [source delta row-keys visitor]
+  (doseq [row-key row-keys]
+    (when (visible-delta-only-row? source delta row-key)
+      (scan-delta-only-row! source delta row-key visitor)))
+  nil)
+
+(defn- distinct-preserving-order [xs]
+  (loop [xs (seq xs)
+         seen #{}
+         out (transient [])]
+    (if-not xs
+      (persistent! out)
+      (let [x (first xs)]
+        (if (contains? seen x)
+          (recur (next xs) seen out)
+          (recur (next xs) (conj seen x) (conj! out x)))))))
+
+(defn scan-overlay-row!
+  "Scans one logical overlay row by row key.
+
+  Visitor arity is `(visitor row-id row-key col-id col-key origin entry-id block)`.
+  Delta-only rows use row-id -1. Delta entries use entry-id -1."
+  [^OverlayCSRView view row-key visitor]
+  (scan-merged-row!* (:source view) (:delta view) row-key visitor))
+
+(defn- scan-overlay-prefix! [^OverlayCSRView view prefix selection visitor]
+  (let [source (:source view)
+        delta (:delta view)
+        prefix (normalize-prefix prefix)
+        prefix-fn (when-not (empty? prefix)
+                    (require-prefix-fn! source selection))
+        ranges (p/csr-resolve-ranges source {:prefix prefix})]
+    (scan-merged-ranges!* source delta ranges visitor)
+    (if (empty? prefix)
+      (if-let [prefix-fn (source-prefix-fn source)]
+        (let [index (overlay-prefix-index! view prefix-fn)]
+          (scan-delta-only-rows! source delta (get index [] []) visitor))
+        (scan-delta-only-rows!
+         source
+         delta
+         (sorted-visible-delta-only-row-keys source delta nil)
+         visitor))
+      (let [index (overlay-prefix-index! view prefix-fn)]
+        (scan-delta-only-rows! source delta (get index prefix []) visitor))))
+  nil)
+
+(defn scan-overlay-selection!
+  "Scans a logical overlay selection.
+
+  `nil` and `{:prefix ...}` include visible delta-only rows. Numeric `:range`
+  and `:ranges` selections scan only base CSR row-id ranges."
+  [^OverlayCSRView view selection visitor]
+  (let [source (:source view)
+        delta (:delta view)]
+    (cond
+      (nil? selection)
+      (scan-overlay-prefix! view [] selection visitor)
+
+      (contains? selection :row-key)
+      (scan-overlay-row! view (:row-key selection) visitor)
+
+      (contains? selection :row-keys)
+      (doseq [row-key (distinct-preserving-order (:row-keys selection))]
+        (scan-overlay-row! view row-key visitor))
+
+      (contains? selection :prefix)
+      (scan-overlay-prefix! view (:prefix selection) selection visitor)
+
+      (or (contains? selection :range)
+          (contains? selection :ranges))
+      (scan-merged-ranges!* source delta (p/csr-resolve-ranges source selection) visitor)
+
+      :else
+      (throw (ex-info "Unsupported overlay selection."
+                      {:selection selection}))))
+  nil)
+
 (extend-type HeapCSRSource
   MergedCSRSource
   (scan-merged-row! [main delta row-key visitor]
@@ -474,8 +621,10 @@
 (def csr-scan-ranges! p/csr-scan-ranges!)
 (def delta-put! p/delta-put!)
 (def delta-delete! p/delta-delete!)
+(def delta-row-keys p/delta-row-keys)
 (def delta-row-entries p/delta-row-entries)
 (def delta-entry p/delta-entry)
 (def delta-clear! p/delta-clear!)
+(def delta-version p/delta-version)
 (def scan-merged-row! p/scan-merged-row!)
 (def scan-merged-ranges! p/scan-merged-ranges!)

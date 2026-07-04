@@ -29,10 +29,14 @@
   merged with."
   (delta-put! [delta row-key col-key block])
   (delta-delete! [delta row-key col-key])
+  (delta-row-keys [delta])
   (delta-row-entries [delta row-key])
   (delta-entry [delta row-key col-key])
-  (delta-clear! [delta]))
+  (delta-clear! [delta])
+  (delta-version [delta]))
 
 (defprotocol MergedCSRSource
   (scan-merged-row! [main delta row-key visitor])
-  (scan-merged-ranges! [main delta ranges visitor]))
+  (scan-merged-ranges! [main delta ranges visitor]
+    "Scans base CSR row-id ranges with delta entries overlaid. This does not
+    discover delta-only rows because numeric ranges address only base rows."))

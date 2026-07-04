@@ -88,6 +88,23 @@
                                   (vec (seq block)))})))
     @seen))
 
+(defn- collect-overlay-selection [source view selection]
+  (let [seen (atom [])]
+    (csr/scan-overlay-selection!
+     view
+     selection
+     (fn [row-id row-key col-id col-key origin entry-id block]
+       (swap! seen conj {:row-id row-id
+                         :row-key row-key
+                         :col-id col-id
+                         :col-key col-key
+                         :origin origin
+                         :entry-id entry-id
+                         :block (if (= :main origin)
+                                  (copied-block source entry-id)
+                                  (vec (seq block)))})))
+    @seen))
+
 (defn- temp-artifact ^Path []
   (Files/createTempFile "sparse-layout-csr-" ".slcsr"
                         (make-array java.nio.file.attribute.FileAttribute 0)))
@@ -276,7 +293,9 @@
     (csr/delta-put! delta :r :a [4.0 5.0 6.0])
     (csr/delta-delete! delta :r :m)
     (is (= [:a :m :z]
-           (mapv :col-key (csr/delta-row-entries delta :r))))))
+           (mapv :col-key (csr/delta-row-entries delta :r))))
+    (is (= [:r] (csr/delta-row-keys delta)))
+    (is (= 3 (csr/delta-version delta)))))
 
 (deftest merged-scan-applies-delta-over-main
   (let [source (csr/dataset->csr-source (test-dataset))
@@ -352,6 +371,118 @@
                 (mapv (fn [{:keys [col-key origin block]}]
                         [col-key origin block])
                       (collect-merged-row mmap delta row-key)))))))))
+
+(deftest overlay-row-selection-includes-delta-only-rows
+  (let [source (csr/dataset->csr-source (test-dataset))
+        delta (csr/make-dok-delta-for-source source)
+        row-key [:tenant-c :portfolio-9 :book-9]
+        view (csr/overlay-view source delta)]
+    (csr/delta-put! delta row-key :f1 [1.0 1.5 2.0])
+    (is (= [[-1 row-key :f1 :delta [1.0 1.5 2.0]]]
+           (mapv (fn [{:keys [row-id row-key col-key origin block]}]
+                   [row-id row-key col-key origin block])
+                 (collect-overlay-selection source view {:row-key row-key}))))))
+
+(deftest overlay-prefix-selection-appends-visible-delta-only-rows
+  (let [source (-> (test-dataset)
+                   csr/dataset->csr-source
+                   (csr/with-range-index identity))
+        delta (csr/make-dok-delta-for-source source)
+        view (csr/overlay-view source delta)
+        delta-row [:tenant-a :portfolio-1 :book-9]
+        delete-only-row [:tenant-a :portfolio-1 :deleted]]
+    (csr/delta-put! delta [:tenant-a :portfolio-1 :book-1] :f1 [100.0 101.0 102.0])
+    (csr/delta-delete! delta [:tenant-a :portfolio-1 :book-1] :f2)
+    (csr/delta-put! delta delta-row :f1 [1.0 1.5 2.0])
+    (csr/delta-delete! delta delete-only-row :f1)
+    (csr/delta-put! delta [:tenant-z :portfolio-9 :book-9] :f1 [9.0 9.5 10.0])
+    (is (= [[[:tenant-a :portfolio-1 :book-1] :f1 :delta]
+            [[:tenant-a :portfolio-1 :book-2] :f1 :main]
+            [delta-row :f1 :delta]]
+           (mapv (fn [{:keys [row-key col-key origin]}]
+                   [row-key col-key origin])
+                 (collect-overlay-selection
+                  source
+                  view
+                  {:prefix [:tenant-a :portfolio-1]}))))))
+
+(deftest overlay-row-key-selection-preserves-caller-order
+  (let [source (csr/dataset->csr-source (test-dataset))
+        delta (csr/make-dok-delta-for-source source)
+        view (csr/overlay-view source delta)
+        delta-row [:tenant-c :portfolio-9 :book-9]
+        base-row [:tenant-a :portfolio-1 :book-2]]
+    (csr/delta-put! delta delta-row :f1 [1.0 1.5 2.0])
+    (is (= [[delta-row :f1 :delta]
+            [base-row :f1 :main]]
+           (mapv (fn [{:keys [row-key col-key origin]}]
+                   [row-key col-key origin])
+                 (collect-overlay-selection
+                  source
+                  view
+                  {:row-keys [delta-row base-row delta-row]}))))))
+
+(deftest overlay-range-selection-stays-base-only
+  (let [source (csr/dataset->csr-source (test-dataset))
+        delta (csr/make-dok-delta-for-source source)
+        view (csr/overlay-view source delta)]
+    (csr/delta-put! delta [:tenant-a :portfolio-1 :book-9] :f1 [1.0 1.5 2.0])
+    (is (= [[[:tenant-a :portfolio-1 :book-1] :f1 :main]
+            [[:tenant-a :portfolio-1 :book-1] :f2 :main]
+            [[:tenant-a :portfolio-1 :book-2] :f1 :main]]
+           (mapv (fn [{:keys [row-key col-key origin]}]
+                   [row-key col-key origin])
+                 (collect-overlay-selection
+                  source
+                  view
+                  {:range {:row-start 0 :row-end 2}}))))))
+
+(deftest overlay-prefix-selection-requires-range-index
+  (let [source (csr/dataset->csr-source (test-dataset))
+        delta (csr/make-dok-delta-for-source source)
+        view (csr/overlay-view source delta)]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"with-range-index"
+         (collect-overlay-selection source view {:prefix [:tenant-a]})))))
+
+(deftest overlay-prefix-index-invalidates-after-delta-mutation
+  (let [source (-> (test-dataset)
+                   csr/dataset->csr-source
+                   (csr/with-range-index identity))
+        delta (csr/make-dok-delta-for-source source)
+        view (csr/overlay-view source delta)
+        row-key [:tenant-c :portfolio-9 :book-9]]
+    (is (empty? (collect-overlay-selection
+                 source
+                 view
+                 {:prefix [:tenant-c]})))
+    (csr/delta-put! delta row-key :f1 [1.0 1.5 2.0])
+    (is (= [[row-key :f1 :delta]]
+           (mapv (fn [{:keys [row-key col-key origin]}]
+                   [row-key col-key origin])
+                 (collect-overlay-selection
+                  source
+                  view
+                  {:prefix [:tenant-c]}))))))
+
+(deftest overlay-prefix-selection-works-against-mmap-sources
+  (let [heap (csr/dataset->csr-source (test-dataset))]
+    (roundtrip-source
+     heap
+     (fn [_ mmap]
+       (let [source (csr/with-range-index mmap identity)
+             delta (csr/make-dok-delta-for-source source)
+             view (csr/overlay-view source delta)
+             row-key [:tenant-c :portfolio-9 :book-9]]
+         (csr/delta-put! delta row-key :f1 [1.0 1.5 2.0])
+         (is (= [[row-key :f1 :delta]]
+                (mapv (fn [{:keys [row-key col-key origin]}]
+                        [row-key col-key origin])
+                      (collect-overlay-selection
+                       source
+                       view
+                       {:prefix [:tenant-c]})))))))))
 
 (deftest delta-put-copies-input-block
   (let [delta (csr/make-dok-delta 3)

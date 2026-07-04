@@ -718,7 +718,8 @@
           ^long rowPtrsOffset
           ^long colIdsOffset
           ^long payloadValuesOffset
-          rangeIndex]
+          rangeIndex
+          prefixFn]
   p/CSRSource
   (csr-row-count [_]
     rowCount)
@@ -823,6 +824,7 @@
                            (:offset (:row-ptrs required))
                            (:offset (:col-ids required))
                            (:offset (:payload-values required))
+                           nil
                            nil))))))
 
 (defn csr-artifact-metadata
@@ -850,7 +852,7 @@
 (defn mmap-csr-source? [source]
   (instance? MmapCSRSource source))
 
-(defn with-mmap-range-index [source _prefix-fn range-index]
+(defn with-mmap-range-index [source prefix-fn range-index]
   (->MmapCSRSource (.-path ^MmapCSRSource source)
                    (.-mapped ^MmapCSRSource source)
                    (.-sectionTable ^MmapCSRSource source)
@@ -865,4 +867,8 @@
                    (.-rowPtrsOffset ^MmapCSRSource source)
                    (.-colIdsOffset ^MmapCSRSource source)
                    (.-payloadValuesOffset ^MmapCSRSource source)
-                   range-index))
+                   range-index
+                   prefix-fn))
+
+(defn mmap-prefix-fn [source]
+  (.-prefixFn ^MmapCSRSource source))
