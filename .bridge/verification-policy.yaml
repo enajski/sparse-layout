@@ -14,6 +14,7 @@ rules:
     unit-tests: required
     lint: required
     format: required
+    benchmarks: required
     property-tests: optional
     runtime-assertions: optional
     docs-or-nl-spec: recommended
@@ -22,6 +23,7 @@ rules:
     - unit
     - lint
     - format
+    - benchmark
   omission-rules:
     allowed?: true
     requires-record?: true
@@ -29,4 +31,4 @@ rules:
     - rationale
     - owner
   notes:
-  - Requires unit, lint, and formatting evidence for code and mixed changes.
+  - Requires unit, lint, formatting, and benchmark smoke evidence for code and mixed changes.

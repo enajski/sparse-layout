@@ -14,6 +14,7 @@ subsystems:
   - unit-tests
   - lint
   - format
+  - benchmarks
   system-category: api
   risk-class: medium
 project-name: sparse-layout
@@ -72,3 +73,16 @@ canonical-commands:
     fi
     exit "$status"
   description: Check advanced formatting via codestyle.advanced-format
+- id: benchmark-smoke
+  kind: benchmark
+  role: regression
+  command: |
+    clojure -M:bench smoke 1>&2
+    status=$?
+    if [ "$status" -eq 0 ]; then
+      printf '\n{:evidence-status "passed"}\n'
+    else
+      printf '\n{:evidence-status "failed" :failure-signals ["clojure -M:bench smoke exited nonzero"]}\n'
+    fi
+    exit "$status"
+  description: Run benchmark smoke checks
