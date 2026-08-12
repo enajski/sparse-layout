@@ -1,34 +1,28 @@
 artifact: verification-policy
-policy-id: sparse-layout-bridge-v1
+policy_id: sparse-layout-bridge-v1
 rules:
 - scope:
     subsystems:
     - core
-    change-categories:
+    change_categories:
     - code-only
     - mixed
-    risk-classes:
+    risk_classes:
     - medium
     - high
-  required-evidence:
-    unit-tests: required
+  required_evidence:
+    unit_tests: required
     lint: required
     format: required
     benchmarks: required
-    property-tests: optional
-    runtime-assertions: optional
-    docs-or-nl-spec: recommended
-  evidence-roles:
+    property_tests: optional
+    runtime_assertions: optional
+    docs_or_nl_spec: recommended
+  evidence_roles:
     regression:
     - unit
     - lint
     - format
     - benchmark
-  omission-rules:
-    allowed?: true
-    requires-record?: true
-    required-fields:
-    - rationale
-    - owner
   notes:
   - Requires unit, lint, formatting, and benchmark smoke evidence for code and mixed changes.

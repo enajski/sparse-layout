@@ -1,39 +1,32 @@
 subsystems:
 - name: core
-  code-globs:
+  code_globs:
   - src/**/*
-  docs-globs:
+  docs_globs:
   - docs/**/*
-  test-globs:
+  test_globs:
   - test/**/*
-  expected-artifacts:
-  - change-intent-card
-  - verification-brief
-  - completeness-ledger
-  expected-evidence:
-  - unit-tests
+  expected_evidence:
+  - unit
   - lint
   - format
-  - benchmarks
-  system-category: api
-  risk-class: medium
-project-name: sparse-layout
-artifact-paths:
+  - benchmark
+  system_category: api
+  risk_class: medium
+project_name: sparse-layout
+artifact_paths:
   root: .bridge/ephemeral
-  phases: .bridge/ephemeral/phases
   evidence: .bridge/ephemeral/evidence
-  evaluations: .bridge/ephemeral/evaluations
-test-paths:
+test_paths:
 - test
-docs-paths:
+docs_paths:
 - docs
-phases: []
 kind: project-profile
-verification-policy-path: .bridge/verification-policy.yaml
-code-paths:
+verification_policy_path: .bridge/verification-policy.yaml
+code_paths:
 - src
-root-path: ..
-canonical-commands:
+root_path: ..
+canonical_commands:
 - id: unit
   kind: unit
   role: regression
