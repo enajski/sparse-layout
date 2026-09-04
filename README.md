@@ -180,6 +180,26 @@ The `sparse-layout.csr-source` namespace exposes a lower-level storage API for f
 (csr/csr-copy-block! source 0 out 0)
 ```
 
+When the consumer is filling primitive arenas, copy whole row ranges instead of
+calling a Clojure function for every edge:
+
+```clojure
+(def ranges [{:row-start 0 :row-end 42}])
+(def entry-capacity 512)
+(def row-ids (int-array entry-capacity))
+(def col-ids (int-array entry-capacity))
+(def blocks (double-array (* entry-capacity (csr/csr-block-dim source))))
+
+(csr/csr-copy-ranges! source ranges row-ids col-ids blocks 0)
+;; => number of copied entries
+```
+
+`csr-copy-ranges!` validates all destination capacities before writing, preserves
+CSR scan order, and supports both heap and mmap sources. `dst-entry-off` selects
+the first row/column slot and the corresponding fixed block in `blocks`. Keep
+`csr-scan-row!`/`csr-scan-ranges!` for custom per-edge logic and overlays; the
+bulk copy is the low-allocation arena path.
+
 `CSRSource` exposes explicit row, column, and entry counts. Row ids, column ids,
 and entry ids are valid only inside their respective count ranges; heap and mmap
 sources reject out-of-range ids instead of reading arbitrary storage.
@@ -209,6 +229,20 @@ For mutable overlays, use `make-dok-delta-for-source` and an overlay view:
 ```
 
 Delta puts override main entries, deletes tombstone main entries, and delta-only rows with visible puts appear in logical overlay selections. Prefix overlay selections require a source prepared with `with-range-index`, so the view can reuse the same row projection for base and delta-only rows. Numeric merged range scans remain base-row-id scans and do not discover delta-only rows; use `scan-overlay-selection!` for user-facing mutable views. Use `make-dok-delta` directly only when you already have an explicit block dimension. Dimensioned deltas reject blocks whose length does not match the source block dimension.
+
+Source-bound deltas cache each row in CSR column order and invalidate only the
+row that changes. The overlay growth benchmark measures value overrides at
+`0/1/10/100/1k/10k/100k` entries, with clustered and scattered row locality,
+against bulk-clean-row splitting and full compaction:
+
+```sh
+clojure -M:overlay-compare smoke
+clojure -J-Xmx6g -M:overlay-compare
+```
+
+The full run uses 262,144 base edges with 295 doubles per edge. Compaction and
+split-plan construction are reported separately from repeated reads, and every
+exact contender is checked against the current overlay output before timing.
 
 The source layer can also persist fixed-double-block CSR sources to a language-neutral mmap artifact:
 
@@ -386,6 +420,35 @@ To compile the benchmark namespace and run each benchmarked operation once witho
 ```sh
 clojure -M:bench smoke
 ```
+
+### DuckDB / Parquet comparison
+
+The matched serving benchmark pins DuckDB 1.5.5, uses a 295-double block per
+`(row-key, col-key)` edge, and fills the same preallocated `int[]`/`double[]`
+destinations through five contenders:
+
+- `csr-copy-ranges!` on a Parquet-derived `CSRSource`;
+- the same source's generic per-edge visitor;
+- Parquet with 295 scalar columns;
+- Parquet with 295 `(lane, value)` rows per edge; and
+- one Parquet list cast back to DuckDB `DOUBLE[295]` before projection.
+
+It verifies exact output equality before timing and reports Parquet generation,
+Parquet → COO → CSR construction, file size, median/p95 materialization time,
+and current-thread JVM allocation. DuckDB native allocation is not included.
+
+```sh
+clojure -M:duckdb-compare smoke
+clojure -J-Xmx4g -M:duckdb-compare small compound
+clojure -J-Xmx6g -M:duckdb-compare medium compound
+clojure -J-Xmx12g -M:duckdb-compare large-only compound
+```
+
+Apache Parquet has no fixed-size-list logical type. The compact source is
+therefore read by DuckDB as `DOUBLE[]`; the benchmark casts it to
+`DOUBLE[295]` to enforce the invariant. DuckDB 1.5.5's Java chunked-result API
+does not expose nested values, so it projects the 295 primitive lanes before
+copying them into the caller's array.
 
 ## Construction Benchmark
 

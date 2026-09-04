@@ -28,6 +28,13 @@
               :jvm-opts ["-XX:+UnlockExperimentalVMOptions"
                          "-XX:CompileCommand=blackhole,criterium.blackhole.Blackhole::consume"]
               :main-opts ["-m" "sparse-layout.construct"]}
+  :duckdb-compare {:extra-paths ["bench"]
+                   :extra-deps {net.mikera/vectorz-clj {:mvn/version "0.48.0"}
+                                org.duckdb/duckdb_jdbc {:mvn/version "1.5.5.0"}}
+                   :main-opts ["-m" "sparse-layout.duckdb-compare"]}
+  :overlay-compare {:extra-paths ["bench"]
+                    :extra-deps {net.mikera/vectorz-clj {:mvn/version "0.48.0"}}
+                    :main-opts ["-m" "sparse-layout.overlay-compare"]}
   :memory {:extra-paths ["bench"]
            :extra-deps {com.clojure-goes-fast/clj-memory-meter {:mvn/version "0.4.0"}
                         net.mikera/vectorz-clj {:mvn/version "0.48.0"}}

@@ -4,7 +4,7 @@
             [sparse-layout.csr-source.protocols :as p :refer
              [CSRSource MutableSparseDelta MergedCSRSource]])
   (:import [sparse_layout.csr_source.artifact MmapCSRSource]
-           [java.util HashMap Map]))
+           [java.util Arrays HashMap Map]))
 
 (def ^:private double-array-class (Class/forName "[D"))
 
@@ -65,12 +65,21 @@
 
 (defn- row-range [start end] {:row-start (int start) :row-end (int end)})
 
-(defn- normalize-range
-  [r]
-  (cond (map? r) [(int (:row-start r)) (int (:row-end r))]
-        (vector? r) [(int (nth r 0)) (int (nth r 1))]
-        (seq? r) [(int (first r)) (int (second r))]
+(defn- range-start
+  ^long [r]
+  (cond (map? r) (long (:row-start r))
+        (vector? r) (long (nth r 0))
+        (seq? r) (long (first r))
         :else (throw (ex-info "Unsupported CSR row range." {:range r}))))
+
+(defn- range-end
+  ^long [r]
+  (cond (map? r) (long (:row-end r))
+        (vector? r) (long (nth r 1))
+        (seq? r) (long (second r))
+        :else (throw (ex-info "Unsupported CSR row range." {:range r}))))
+
+(defn- normalize-range [r] [(int (range-start r)) (int (range-end r))])
 
 (defn- normalize-prefix
   [prefix]
@@ -168,6 +177,78 @@
                       {:dst-off dst-off :block-dim block-dim :dst-length dst-len})))
     dst-off))
 
+(defn- ensure-row-range!
+  [start end row-count]
+  (let [start
+        (long start)
+
+        end
+        (long end)
+
+        row-count
+        (long row-count)]
+
+    (when (or (neg? start) (> start end) (> end row-count))
+      (throw (ex-info "CSR row range is out of bounds."
+                      {:row-start start :row-end end :row-count row-count}))))
+  nil)
+
+(defn- ensure-ranges-copy-target!
+  [dst-row-ids dst-col-ids dst-values dst-entry-off entry-count block-dim]
+  (let [dst-row-ids
+        ^ints dst-row-ids
+
+        dst-col-ids
+        ^ints dst-col-ids
+
+        dst-values
+        ^doubles dst-values
+
+        dst-entry-off
+        (long dst-entry-off)
+
+        entry-count
+        (long entry-count)
+
+        block-dim
+        (long block-dim)
+
+        entry-end
+        (+ dst-entry-off entry-count)
+
+        value-end
+        (* entry-end block-dim)]
+
+    (when (or (neg? dst-entry-off)
+              (> entry-end (alength dst-row-ids))
+              (> entry-end (alength dst-col-ids))
+              (> value-end (alength dst-values)))
+      (throw (ex-info "CSR range copy destination is out of bounds."
+                      {:dst-entry-off dst-entry-off
+                       :entry-count entry-count
+                       :block-dim block-dim
+                       :row-id-capacity (alength dst-row-ids)
+                       :col-id-capacity (alength dst-col-ids)
+                       :value-capacity (alength dst-values)}))))
+  nil)
+
+(defn- heap-ranges-entry-count
+  ^long [^ints row-ptrs ranges ^long row-count]
+  (loop [remaining
+         (seq ranges)
+
+         total
+         (long 0)]
+
+    (if-let [r (first remaining)]
+      (let [start (range-start r)
+            end (range-end r)]
+
+        (ensure-row-range! start end row-count)
+        (recur (next remaining)
+               (+ total (- (aget row-ptrs (int end)) (aget row-ptrs (int start))))))
+      total)))
+
 (deftype HeapCSRSource [^Map rowToId ^objects idToRow ^Map colToId ^objects idToCol ^ints rowPtrs
                         ^ints colIds ^doubles payloadValues ^long payloadDim rangeIndex prefixFn]
   CSRSource
@@ -201,6 +282,57 @@
 
         (System/arraycopy payloadValues (int start) dst (int dst-off) (int payloadDim))
         dst))
+    (csr-copy-ranges! [_ ranges dst-row-ids dst-col-ids dst-values dst-entry-off]
+      (let [dst-row-ids
+            ^ints dst-row-ids
+
+            dst-col-ids
+            ^ints dst-col-ids
+
+            dst-values
+            ^doubles dst-values
+
+            dst-entry-off
+            (long dst-entry-off)
+
+            entry-count
+            (heap-ranges-entry-count rowPtrs ranges (alength idToRow))]
+
+        (ensure-ranges-copy-target! dst-row-ids
+                                    dst-col-ids
+                                    dst-values
+                                    dst-entry-off
+                                    entry-count
+                                    payloadDim)
+        (loop [remaining
+               (seq ranges)
+
+               copied
+               (long 0)]
+
+          (if-let [r (first remaining)]
+            (let [row-start (range-start r)
+                  row-end (range-end r)
+                  entry-start (aget rowPtrs (int row-start))
+                  entry-end (aget rowPtrs (int row-end))
+                  range-count (- entry-end entry-start)
+                  range-dst (+ dst-entry-off copied)]
+
+              (System/arraycopy colIds entry-start dst-col-ids (int range-dst) range-count)
+              (System/arraycopy payloadValues
+                                (* entry-start payloadDim)
+                                dst-values
+                                (int (* range-dst payloadDim))
+                                (int (* range-count payloadDim)))
+              (loop [row-id row-start]
+                (when (< row-id row-end)
+                  (Arrays/fill dst-row-ids
+                               (int (+ range-dst (- (aget rowPtrs (int row-id)) entry-start)))
+                               (int (+ range-dst (- (aget rowPtrs (inc (int row-id))) entry-start)))
+                               (int row-id))
+                  (recur (inc row-id))))
+              (recur (next remaining) (+ copied range-count)))
+            copied))))
     (csr-scan-row! [this row-id visitor]
       (let [row-id*
             (int (ensure-index! :row-id row-id (alength idToRow)))
@@ -311,55 +443,71 @@
                                        str)})))]
     (ensure-block-length! out expected)))
 
-(deftype DokDelta [^HashMap rows blockDim ^:unsynchronized-mutable ^long version]
-  MutableSparseDelta
-    (delta-put! [this row-key col-key block]
-      (let [^HashMap row (or (.get rows row-key)
-                             (let [m (HashMap.)]
-                               (.put rows row-key m)
-                               m))]
-        (.put row
-              col-key
-              {:op :put :row-key row-key :col-key col-key :block (copy-block block blockDim)})
-        (set! version (inc version))
-        this))
-    (delta-delete! [this row-key col-key]
-      (let [^HashMap row (or (.get rows row-key)
-                             (let [m (HashMap.)]
-                               (.put rows row-key m)
-                               m))]
-        (.put row col-key {:op :delete :row-key row-key :col-key col-key})
-        (set! version (inc version))
-        this))
-    (delta-row-keys [_] (vec (keys rows)))
-    (delta-row-entries [_ row-key]
-      (if-let [row ^HashMap (.get rows row-key)]
-        (->> (vals row)
-             (sort-by (fn [{:keys [col-key]}]
-                        (pr-str col-key)))
-             vec)
-        []))
-    (delta-entry [_ row-key col-key]
-      (when-let [row ^HashMap (.get rows row-key)]
-        (.get row col-key)))
-    (delta-clear! [this] (.clear rows) (set! version (inc version)) this)
-    (delta-version [_] version))
-
-(defn make-dok-delta [block-dim] (->DokDelta (HashMap.) (normalize-block-dim block-dim) 0))
-
-(defn make-dok-delta-for-source [source] (make-dok-delta (p/csr-block-dim source)))
-
 (defn- col-sort-key
   [source col-key]
   (let [col-id (p/csr-col-id source col-key)]
     (if (neg? col-id) [1 (pr-str col-key)] [0 col-id])))
 
+(deftype DokRow [^HashMap entries sortedEntries])
+
+(defn- dok-row-entries
+  [^DokRow row source]
+  (or @(.-sortedEntries row)
+      (let [entries (->> (vals (.-entries row))
+                         (sort-by (fn [{:keys [col-key]}]
+                                    (if source (col-sort-key source col-key) (pr-str col-key))))
+                         vec)]
+        (vreset! (.-sortedEntries row) entries)
+        entries)))
+
+(deftype DokDelta [^HashMap rows blockDim source ^:unsynchronized-mutable ^long version]
+  MutableSparseDelta
+    (delta-put! [this row-key col-key block]
+      (let [^DokRow row (or (.get rows row-key)
+                            (let [r (->DokRow (HashMap.) (volatile! nil))]
+                              (.put rows row-key r)
+                              r))]
+        (.put (.-entries row)
+              col-key
+              {:op :put :row-key row-key :col-key col-key :block (copy-block block blockDim)})
+        (vreset! (.-sortedEntries row) nil)
+        (set! version (inc version))
+        this))
+    (delta-delete! [this row-key col-key]
+      (let [^DokRow row (or (.get rows row-key)
+                            (let [r (->DokRow (HashMap.) (volatile! nil))]
+                              (.put rows row-key r)
+                              r))]
+        (.put (.-entries row) col-key {:op :delete :row-key row-key :col-key col-key})
+        (vreset! (.-sortedEntries row) nil)
+        (set! version (inc version))
+        this))
+    (delta-row-keys [_] (vec (keys rows)))
+    (delta-row-entries [_ row-key]
+      (if-let [row ^DokRow (.get rows row-key)]
+        (dok-row-entries row source)
+        []))
+    (delta-entry [_ row-key col-key]
+      (when-let [row ^DokRow (.get rows row-key)]
+        (.get (.-entries row) col-key)))
+    (delta-clear! [this] (.clear rows) (set! version (inc version)) this)
+    (delta-version [_] version))
+
+(defn make-dok-delta [block-dim] (->DokDelta (HashMap.) (normalize-block-dim block-dim) nil 0))
+
+(defn make-dok-delta-for-source
+  [source]
+  (->DokDelta (HashMap.) (normalize-block-dim (p/csr-block-dim source)) source 0))
+
 (defn- sorted-delta-row
   [source delta row-key]
-  (->> (p/delta-row-entries delta row-key)
-       (sort-by (fn [{:keys [col-key]}]
-                  (col-sort-key source col-key)))
-       vec))
+  (let [entries (p/delta-row-entries delta row-key)]
+    (if (and (instance? DokDelta delta) (identical? source (.-source ^DokDelta delta)))
+      entries
+      (->> entries
+           (sort-by (fn [{:keys [col-key]}]
+                      (col-sort-key source col-key)))
+           vec))))
 
 (defn- emit-main!
   [source row-id row-key entry-id visitor]
@@ -644,6 +792,7 @@
 (def csr-row-span p/csr-row-span)
 (def csr-entry-col-id p/csr-entry-col-id)
 (def csr-copy-block! p/csr-copy-block!)
+(def csr-copy-ranges! p/csr-copy-ranges!)
 (def csr-scan-row! p/csr-scan-row!)
 (def csr-resolve-ranges p/csr-resolve-ranges)
 (def csr-scan-ranges! p/csr-scan-ranges!)

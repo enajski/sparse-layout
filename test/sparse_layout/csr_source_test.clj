@@ -3,7 +3,8 @@
             [sparse-layout.core :refer [defsparse]]
             [sparse-layout.csr-source :as csr])
   (:import [java.nio ByteBuffer ByteOrder]
-           [java.nio.file Files Path StandardOpenOption]))
+           [java.nio.file Files Path StandardOpenOption]
+           [java.util Arrays]))
 
 (defsparse
   query-features
@@ -182,6 +183,53 @@
     (csr/csr-copy-block! source 1 out 2)
     (is (= [0.0 0.0 4.0 5.0 6.0] (vec (seq out))))))
 
+(defn- copied-ranges
+  [source]
+  (let [rows
+        (int-array 6)
+
+        cols
+        (int-array 6)
+
+        values
+        (double-array 18)]
+
+    (Arrays/fill rows -1)
+    (Arrays/fill cols -1)
+    (Arrays/fill values -1.0)
+    {:count (csr/csr-copy-ranges! source [{:row-start 0 :row-end 2} [3 4]] rows cols values 1)
+     :rows (vec rows)
+     :cols (vec cols)
+     :values (vec values)}))
+
+(deftest copies-ranges-in-bulk-for-heap-and-mmap-sources
+  (let [heap
+        (csr/dataset->csr-source (test-dataset))
+
+        expected
+        {:count 4
+         :rows [-1 0 0 1 3 -1]
+         :cols [-1 0 1 0 1 -1]
+         :values [-1.0 -1.0 -1.0 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0 13.0 14.0 15.0 -1.0 -1.0
+                  -1.0]}]
+
+    (is (= expected (copied-ranges heap)))
+    (let [rows (int-array 2)]
+      (Arrays/fill rows -1)
+      (is (= "CSR range copy destination is out of bounds."
+             (try (csr/csr-copy-ranges! heap
+                                        [{:row-start 0 :row-end 2}]
+                                        rows
+                                        (int-array 2)
+                                        (double-array 6)
+                                        0)
+                  nil
+                  (catch clojure.lang.ExceptionInfo e (.getMessage e)))))
+      (is (= [-1 -1] (vec rows))))
+    (roundtrip-source heap
+                      (fn [_ mmap]
+                        (is (= expected (copied-ranges mmap)))))))
+
 (deftest writes-language-neutral-artifact-header
   (let [bytes (artifact-bytes (csr/dataset->csr-source (test-dataset)))]
     (is (= (concat (mapv #(bit-and (int %) 0xff) (artifact-magic-bytes))
@@ -270,8 +318,10 @@
     (csr/delta-put! delta :r :a [4.0 5.0 6.0])
     (csr/delta-delete! delta :r :m)
     (is (= [:a :m :z] (mapv :col-key (csr/delta-row-entries delta :r))))
+    (csr/delta-put! delta :r :b [7.0 8.0 9.0])
+    (is (= [:a :b :m :z] (mapv :col-key (csr/delta-row-entries delta :r))))
     (is (= [:r] (csr/delta-row-keys delta)))
-    (is (= 3 (csr/delta-version delta)))))
+    (is (= 4 (csr/delta-version delta)))))
 
 (deftest merged-scan-applies-delta-over-main
   (let [source

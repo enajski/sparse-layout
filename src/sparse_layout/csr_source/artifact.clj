@@ -2,11 +2,11 @@
   (:require [sparse-layout.core :as sparse]
             [sparse-layout.csr-source.protocols :as p])
   (:import [java.io ByteArrayOutputStream]
-           [java.nio ByteBuffer ByteOrder MappedByteBuffer]
+           [java.nio ByteBuffer ByteOrder DoubleBuffer IntBuffer MappedByteBuffer]
            [java.nio.channels FileChannel FileChannel$MapMode]
            [java.nio.charset StandardCharsets]
            [java.nio.file Files Path Paths StandardOpenOption]
-           [java.util HashMap Map]))
+           [java.util Arrays HashMap Map]))
 
 (def ^:private artifact-version 1)
 (def ^:private endian-marker 0x01020304)
@@ -48,12 +48,21 @@
 
 (defn- row-range [start end] {:row-start (int start) :row-end (int end)})
 
-(defn- normalize-range
-  [r]
-  (cond (map? r) [(int (:row-start r)) (int (:row-end r))]
-        (vector? r) [(int (nth r 0)) (int (nth r 1))]
-        (seq? r) [(int (first r)) (int (second r))]
+(defn- range-start
+  ^long [r]
+  (cond (map? r) (long (:row-start r))
+        (vector? r) (long (nth r 0))
+        (seq? r) (long (first r))
         :else (throw (ex-info "Unsupported CSR row range." {:range r}))))
+
+(defn- range-end
+  ^long [r]
+  (cond (map? r) (long (:row-end r))
+        (vector? r) (long (nth r 1))
+        (seq? r) (long (second r))
+        :else (throw (ex-info "Unsupported CSR row range." {:range r}))))
+
+(defn- normalize-range [r] [(int (range-start r)) (int (range-end r))])
 
 (defn- normalize-prefix
   [prefix]
@@ -102,6 +111,61 @@
       (throw (ex-info "CSRSource copy destination is out of bounds."
                       {:dst-off dst-off :block-dim block-dim :dst-length dst-len})))
     dst-off))
+
+(defn- ensure-row-range!
+  [start end row-count]
+  (let [start
+        (long start)
+
+        end
+        (long end)
+
+        row-count
+        (long row-count)]
+
+    (when (or (neg? start) (> start end) (> end row-count))
+      (throw (ex-info "CSR row range is out of bounds."
+                      {:row-start start :row-end end :row-count row-count}))))
+  nil)
+
+(defn- ensure-ranges-copy-target!
+  [dst-row-ids dst-col-ids dst-values dst-entry-off entry-count block-dim]
+  (let [dst-row-ids
+        ^ints dst-row-ids
+
+        dst-col-ids
+        ^ints dst-col-ids
+
+        dst-values
+        ^doubles dst-values
+
+        dst-entry-off
+        (long dst-entry-off)
+
+        entry-count
+        (long entry-count)
+
+        block-dim
+        (long block-dim)
+
+        entry-end
+        (+ dst-entry-off entry-count)
+
+        value-end
+        (* entry-end block-dim)]
+
+    (when (or (neg? dst-entry-off)
+              (> entry-end (alength dst-row-ids))
+              (> entry-end (alength dst-col-ids))
+              (> value-end (alength dst-values)))
+      (throw (ex-info "CSR range copy destination is out of bounds."
+                      {:dst-entry-off dst-entry-off
+                       :entry-count entry-count
+                       :block-dim block-dim
+                       :row-id-capacity (alength dst-row-ids)
+                       :col-id-capacity (alength dst-col-ids)
+                       :value-capacity (alength dst-values)}))))
+  nil)
 
 (defn- checked-byte-length
   ^long [type count]
@@ -211,6 +275,45 @@
 (defn- bb-get-double
   ^double [^ByteBuffer buffer ^long offset]
   (.getDouble buffer (int (checked-index offset))))
+
+(defn- bb-copy-ints!
+  [^ByteBuffer buffer offset ^ints dst dst-off length]
+  (let [view ^IntBuffer
+             (-> (.duplicate buffer)
+                 (buffer-order!)
+                 (.position (int (checked-index offset)))
+                 (.asIntBuffer))]
+    (.get view dst (int dst-off) (int length)))
+  dst)
+
+(defn- bb-copy-doubles!
+  [^ByteBuffer buffer offset ^doubles dst dst-off length]
+  (let [view ^DoubleBuffer
+             (-> (.duplicate buffer)
+                 (buffer-order!)
+                 (.position (int (checked-index offset)))
+                 (.asDoubleBuffer))]
+    (.get view dst (int dst-off) (int length)))
+  dst)
+
+(defn- mmap-ranges-entry-count
+  ^long [^ByteBuffer buffer row-ptrs-offset ranges ^long row-count]
+  (loop [remaining
+         (seq ranges)
+
+         total
+         (long 0)]
+
+    (if-let [r (first remaining)]
+      (let [start (range-start r)
+            end (range-end r)]
+
+        (ensure-row-range! start end row-count)
+        (recur (next remaining)
+               (+ total
+                  (- (bb-get-int buffer (+ row-ptrs-offset (* end 4)))
+                     (bb-get-int buffer (+ row-ptrs-offset (* start 4)))))))
+      total)))
 
 (defn- read-bytes
   ^bytes [^ByteBuffer buffer ^long offset ^long length]
@@ -873,6 +976,65 @@
         (dotimes [idx (int payloadDim)]
           (aset dst (+ (int dst-off) idx) (bb-get-double mapped (+ start (* idx 8)))))
         dst))
+    (csr-copy-ranges! [_ ranges dst-row-ids dst-col-ids dst-values dst-entry-off]
+      (let [dst-row-ids
+            ^ints dst-row-ids
+
+            dst-col-ids
+            ^ints dst-col-ids
+
+            dst-values
+            ^doubles dst-values
+
+            dst-entry-off
+            (long dst-entry-off)
+
+            entry-count
+            (mmap-ranges-entry-count mapped rowPtrsOffset ranges rowCount)]
+
+        (ensure-ranges-copy-target! dst-row-ids
+                                    dst-col-ids
+                                    dst-values
+                                    dst-entry-off
+                                    entry-count
+                                    payloadDim)
+        (loop [remaining
+               (seq ranges)
+
+               copied
+               (long 0)]
+
+          (if-let [r (first remaining)]
+            (let [row-start (range-start r)
+                  row-end (range-end r)
+                  entry-start (bb-get-int mapped (+ rowPtrsOffset (* row-start 4)))
+                  entry-end (bb-get-int mapped (+ rowPtrsOffset (* row-end 4)))
+                  range-count (- entry-end entry-start)
+                  range-dst (+ dst-entry-off copied)]
+
+              (bb-copy-ints! mapped
+                             (+ colIdsOffset (* entry-start 4))
+                             dst-col-ids
+                             range-dst
+                             range-count)
+              (bb-copy-doubles! mapped
+                                (+ payloadValuesOffset (* entry-start payloadDim 8))
+                                dst-values
+                                (* range-dst payloadDim)
+                                (* range-count payloadDim))
+              (loop [row-id row-start]
+                (when (< row-id row-end)
+                  (Arrays/fill dst-row-ids
+                               (int (+ range-dst
+                                       (- (bb-get-int mapped (+ rowPtrsOffset (* row-id 4)))
+                                          entry-start)))
+                               (int (+ range-dst
+                                       (- (bb-get-int mapped (+ rowPtrsOffset (* (inc row-id) 4)))
+                                          entry-start)))
+                               (int row-id))
+                  (recur (inc row-id))))
+              (recur (next remaining) (+ copied range-count)))
+            copied))))
     (csr-scan-row! [this row-id visitor]
       (let [row-id*
             (int (ensure-index! :row-id row-id rowCount))

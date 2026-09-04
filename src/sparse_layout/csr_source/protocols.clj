@@ -18,6 +18,10 @@
   (csr-entry-col-id [src entry-id])
   (csr-copy-block! [src entry-id dst dst-off]
     "Copies one fixed-width payload block into dst at dst-off and returns dst.")
+  (csr-copy-ranges! [src ranges dst-row-ids dst-col-ids dst-values dst-entry-off]
+    "Copies ranges in CSR scan order into caller-owned primitive arrays.
+    `dst-entry-off` indexes the row/column arrays and the corresponding fixed
+    block in `dst-values`. Returns the number of copied entries.")
   (csr-scan-row! [src row-id visitor])
   (csr-resolve-ranges [src selection])
   (csr-scan-ranges! [src ranges visitor]))
@@ -30,7 +34,9 @@
   (delta-put! [delta row-key col-key block])
   (delta-delete! [delta row-key col-key])
   (delta-row-keys [delta])
-  (delta-row-entries [delta row-key])
+  (delta-row-entries [delta row-key]
+    "Returns a cached deterministic row. Generic deltas use printed-key order;
+    deltas made for a source use that source's CSR column order.")
   (delta-entry [delta row-key col-key])
   (delta-clear! [delta])
   (delta-version [delta]))

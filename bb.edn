@@ -1,4 +1,4 @@
-{:deps {io.github.enajski/bridge {:git/sha "f347f3274f2c934eb1290398e5f29d73ee2b6424"}}
+{:deps {com.blockether/bridge {:mvn/version "0.3.0"}}
  :tasks
  {bridge {:doc "Runs the Bridge verification workflow CLI"
           :requires ([bridge.cli :as cli])
