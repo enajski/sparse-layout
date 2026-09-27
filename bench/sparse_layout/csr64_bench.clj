@@ -618,6 +618,21 @@
         (if (csr64/copy-point! mapped (aget rows index) (aget cols index) dst 0) (inc hits) hits))
       hits)))
 
+(defn- copy-point-4-hits
+  "Like `copy-point-hits`, through the four-argument `copy-point!`."
+  ^long [mapped ^longs rows ^longs cols ^doubles dst]
+  (loop [index
+         0
+
+         hits
+         0]
+
+    (if (< index (alength rows))
+      (recur
+        (inc index)
+        (if (csr64/copy-point! mapped (aget rows index) (aget cols index) dst) (inc hits) hits))
+      hits)))
+
 (defn- open-entry-count
   ^long [path]
   (with-open [source (csr64/open-artifact path)]
@@ -674,6 +689,44 @@
             (+ sum (page-id-sum (csr64/page-rows page) (csr64/page-cols page) (count page))))
           0
           (csr64/pages mapped buf)))
+
+(defn- copy-rows-by-entry!
+  "Copies rows [row-start, row-end) into `buf`'s arrays with the README's whole-block
+  `reduce-entries` loop, one `csr-copy-block!` per entry; returns the entry count."
+  ^long [mapped buf ^long row-start ^long row-end]
+  (let [row-ids
+        (csr64/page-rows buf)
+
+        col-ids
+        (csr64/page-cols buf)
+
+        values
+        (csr64/page-values buf)
+
+        dim
+        (csr64/block-dim mapped)]
+
+    (csr64/reduce-entries [row col e]
+                          [mapped row-start row-end]
+                          [slot 0]
+                          (aset row-ids slot (int row))
+                          (aset col-ids slot (int col))
+                          (csr/csr-copy-block! mapped e values (* slot dim))
+                          (inc slot))))
+
+(defn- copy-blocks-reduce-entries-sum
+  "Drains every row, `rows-per-page` rows at a time, through `copy-rows-by-entry!`."
+  ^long [mapped buf ^long rows-per-page]
+  (let [row-count (csr64/row-count mapped)]
+    (loop [row-start 0
+           sum 0]
+
+      (if (< row-start row-count)
+        (let [row-end (min row-count (+ row-start rows-per-page))
+              copied (copy-rows-by-entry! mapped buf row-start row-end)]
+
+          (recur row-end (+ sum (page-id-sum (csr64/page-rows buf) (csr64/page-cols buf) copied))))
+        sum))))
 
 (defn- page-lane-0-sum
   ^double [^doubles values ^long dim ^long entry-count]
@@ -745,12 +798,24 @@
      {:label :copy-point
       :f #(copy-point-hits mapped rows cols dst)
       :expected (expected-hits config cols)}
+     {:label :copy-point-4
+      :f #(copy-point-4-hits mapped rows cols dst)
+      :expected (expected-hits config cols)}
      {:label :open-and-validate :f #(open-entry-count path) :expected entry-count}
      {:label :drain-copy-page
       :f #(drain-copy-page-sum mapped page-rows page-cols page-values)
       :expected drain-sum}
      (let [buf (csr64/page mapped api-page-capacity)]
        {:label :drain-pages :f #(drain-pages-sum mapped buf) :expected drain-sum})
+     (let [buf
+           (csr64/page mapped api-page-capacity)
+
+           rows-per-page
+           (quot api-page-capacity (long (:entries-per-row config)))]
+
+       {:label :copy-blocks-reduce-entries
+        :f #(copy-blocks-reduce-entries-sum mapped buf rows-per-page)
+        :expected drain-sum})
      {:label :lane-0-copy-pages
       :f #(lane-0-copy-pages-sum mapped page-rows page-cols page-values)
       :expected (double entry-count)}
@@ -804,9 +869,9 @@
 
 (defn- print-api-results
   [results]
-  (println (format "%-22s %10s %16s" "variant" "median ms" "alloc bytes/call"))
+  (println (format "%-26s %10s %16s" "variant" "median ms" "alloc bytes/call"))
   (doseq [{:keys [label median-ns median-allocated-bytes]} results]
-    (println (format "%-22s %10.3f %,16d"
+    (println (format "%-26s %10.3f %,16d"
                      (name label)
                      (/ (long median-ns) 1000000.0)
                      median-allocated-bytes))))

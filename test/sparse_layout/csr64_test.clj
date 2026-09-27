@@ -114,6 +114,35 @@
 
       (if (< k dim) (recur (inc k) (+ sum (csr64/lane source e k))) sum))))
 
+(defn- copy-entries!
+  "The README's whole-block loop: one `csr-copy-block!` per entry; returns the entry count."
+  [mapped ^ints row-ids ^ints col-ids ^doubles values row-start row-end]
+  (let [dim (csr64/block-dim mapped)]
+    (csr64/reduce-entries [row col e]
+                          [mapped row-start row-end]
+                          [slot 0]
+                          (aset row-ids slot (int row))
+                          (aset col-ids slot (int col))
+                          (csr/csr-copy-block! mapped e values (* slot dim))
+                          (inc slot))))
+
+(defn- thrown-info
+  "Returns the message and data of the `ExceptionInfo` that `f` throws, or nil."
+  [f]
+  (try (f) nil (catch clojure.lang.ExceptionInfo e [(ex-message e) (ex-data e)])))
+
+(defn- point-copy
+  "Calls `copy!` with a fresh block of `dim` doubles; returns whether it returned that block (nil
+  when it returned nil) and the block's values."
+  [dim copy!]
+  (let [dst
+        (double-array dim)
+
+        result
+        (copy! dst)]
+
+    [(when result (identical? dst result)) (vec dst)]))
+
 (deftest roundtrips-through-long-addressed-memory-segments
   (let [heap
         (test-source)
@@ -205,6 +234,39 @@
                              clojure.lang.ExceptionInfo
                              #"out of bounds"
                              (csr64/copy-point! mapped row-id col-id values 0))))))))
+
+(deftest point-reads-name-the-first-out-of-range-id
+  (with-artifact (test-source)
+                 (fn [_ mapped]
+                   (doseq [[row-id col-id data] [[-1 0 {:index :row-id :value -1 :upper-bound 4}]
+                                                 [4 0 {:index :row-id :value 4 :upper-bound 4}]
+                                                 [0 -1 {:index :col-id :value -1 :upper-bound 2}]
+                                                 [0 2 {:index :col-id :value 2 :upper-bound 2}]
+                                                 [-1 2 {:index :row-id :value -1 :upper-bound 4}]]]
+                     (is (= ["CSR64 index is out of bounds." data]
+                            (thrown-info #(csr64/find-entry mapped row-id col-id))))))))
+
+(deftest four-argument-copy-point-copies-to-offset-zero
+  (is (instance? clojure.lang.IFn$OLLOO csr64/copy-point!))
+  (doseq [[source [present-row present-col]] [[(test-source) [0 1]] [(gapped-source) [2 2]]]]
+    (with-artifact
+      source
+      (fn [_ mapped]
+        (let [dim (csr64/block-dim mapped)
+              row-count (csr64/row-count mapped)
+              col-count (csr64/col-count mapped)]
+
+          (doseq [row-id (range row-count)
+                  col-id (range col-count)]
+
+            (is (= (point-copy dim #(csr64/copy-point! mapped row-id col-id % 0))
+                   (point-copy dim #(csr64/copy-point! mapped row-id col-id %)))))
+          (doseq [[row-id col-id dst] [[-1 0 (double-array dim)] [row-count 0 (double-array dim)]
+                                       [0 -1 (double-array dim)] [0 col-count (double-array dim)]
+                                       [present-row present-col (double-array (dec dim))]]]
+            (let [thrown (thrown-info #(csr64/copy-point! mapped row-id col-id dst 0))]
+              (is (some? thrown))
+              (is (= thrown (thrown-info #(csr64/copy-point! mapped row-id col-id dst)))))))))))
 
 (deftest reading-requires-a-little-endian-host
   (is (nil? (#'csr64/ensure-little-endian-host! ByteOrder/LITTLE_ENDIAN)))
@@ -381,6 +443,27 @@
                                                     [acc 0.0]
                                                     (+ acc (block-sum mapped e))))))))))
 
+(deftest reduce-entries-copies-whole-blocks-like-copy-page
+  (doseq [source [(test-source) (gapped-source)]]
+    (with-artifact
+      source
+      (fn [_ mapped]
+        (doseq [[row-start row-end] [[0 4] [0 2] [1 3] [2 4] [3 4] [2 2]]]
+          (testing (pr-str [row-start row-end])
+            (let [capacity (max 1 (csr64/range-entry-count mapped row-start row-end))
+                  copied (fn [copy!]
+                           (let [rows (int-array capacity -1)
+                                 cols (int-array capacity -1)
+                                 values (double-array (* capacity (csr64/block-dim mapped)) -1.0)]
+
+                             {:count (copy! rows cols values)
+                              :rows (vec rows)
+                              :cols (vec cols)
+                              :values (vec values)}))]
+
+              (is (= (copied #(csr64/copy-page! mapped row-start row-end 0 capacity %1 %2 %3 0))
+                     (copied #(copy-entries! mapped %1 %2 %3 row-start row-end)))))))))))
+
 (deftest reduce-entries-evaluates-its-arguments-once
   (with-artifact
     (test-source)
@@ -434,6 +517,40 @@
           (is (thrown? IllegalStateException
                        (csr64/reduce-entries [_row _col _e] [closed] [acc 0] (inc acc)))))))))
 
+(deftest direct-lane-calls-match-calls-through-the-var
+  (doseq [source [(test-source) (gapped-source)]]
+    (with-artifact
+      source
+      (fn [path mapped]
+        (let [entries (csr64/entry-count mapped)
+              dim (csr64/block-dim mapped)]
+
+          (doseq [e (range entries)
+                  k (range dim)]
+
+            (is (= (csr64/lane mapped e k)
+                   (apply csr64/lane [mapped e k])
+                   (#'csr64/lane mapped e k))))
+          (doseq [[e k data] [[-1 0 {:index :entry-id :value -1 :upper-bound entries}]
+                              [entries 0 {:index :entry-id :value entries :upper-bound entries}]
+                              [0 -1 {:index :lane :value -1 :upper-bound dim}]
+                              [0 dim {:index :lane :value dim :upper-bound dim}]]]
+            (is (= ["CSR64 index is out of bounds." data]
+                   (thrown-info #(csr64/lane mapped e k))
+                   (thrown-info #(apply csr64/lane [mapped e k]))
+                   (thrown-info #(#'csr64/lane mapped e k)))))
+          (testing "a redefinition reaches calls through the var, not compiled direct calls"
+            (let [value (csr64/lane mapped 0 0)]
+              (with-redefs [csr64/lane (constantly -1.0)]
+                (is (= value (csr64/lane mapped 0 0)))
+                (is (= -1.0 (apply csr64/lane [mapped 0 0]) (#'csr64/lane mapped 0 0))))))
+          (testing "closed source"
+            (let [closed (with-open [reopened (csr64/open-artifact path)]
+                           reopened)]
+              (is (thrown? IllegalStateException (csr64/lane closed 0 0)))
+              (is (thrown? IllegalStateException (apply csr64/lane [closed 0 0])))
+              (is (thrown? IllegalStateException (#'csr64/lane closed 0 0))))))))))
+
 (deftest reduce-entries-compiles-without-reflection-or-boxing
   (let [warnings (java.io.StringWriter.)]
     (binding [*err* warnings]
@@ -442,6 +559,7 @@
     (with-artifact (test-source)
                    (fn [_ mapped]
                      (is (= 35.0 ((resolve 'sparse-layout.csr64-probe/lane-0-sum) mapped)))
+                     (is (= 120.0 ((resolve 'sparse-layout.csr64-probe/lane-sum) mapped)))
                      (is (= 3 ((resolve 'sparse-layout.csr64-probe/row-col-sum) mapped 1 3)))))))
 
 (defn- ledger-fixture
@@ -556,6 +674,23 @@
         (is (= [13.0 14.0 15.0] (vec point)))
         (testing "an absent coordinate in a row without structural patches"
           (is (nil? (overlay/copy-point! (overlay/compile-ledger mapped []) 1 1 point 0))))))))
+
+(deftest ledger-overlay-copy-point-copies-to-offset-zero
+  (with-artifact
+    (test-source)
+    (fn [_ mapped]
+      (doseq [view
+              [(overlay/compile-ledger mapped (ledger-fixture (double-array [40.0 41.0 42.0])))
+               (overlay/compile-ledger mapped [])]
+
+              row-id
+              (range 4)
+
+              col-id
+              (range 2)]
+
+        (is (= (point-copy 3 #(overlay/copy-point! view row-id col-id % 0))
+               (point-copy 3 #(overlay/copy-point! view row-id col-id %))))))))
 
 (deftest ledger-overlay-resumes-bulk-copy-after-a-structural-row
   (with-artifact (test-source)

@@ -306,8 +306,8 @@ the next copy. `row-count`, `col-count`, `entry-count` and `block-dim` return
 the shape as primitive longs, and printing a source or a page shows only its
 path and shape.
 
-When a reduction needs only a few lanes per entry, read the mapping instead of
-copying blocks:
+`reduce-entries` reads the mapping entry by entry, without a page buffer. When a
+reduction needs only a few lanes per entry, read them with `lane`:
 
 ```clojure
 (defn weighted-lane-0
@@ -317,20 +317,38 @@ copying blocks:
     (+ acc (* (aget weights col) (csr64/lane mapped e 0)))))
 ```
 
+To copy whole blocks, call `csr/csr-copy-block!` once per entry instead of
+`lane` once per double:
+
+```clojure
+(defn copy-entries!
+  "Copies the entries of rows [row-start, row-end) into caller-owned arrays
+  sized for them; returns the number of entries."
+  [mapped ^ints row-ids ^ints col-ids ^doubles values row-start row-end]
+  (let [dim (csr64/block-dim mapped)]
+    (csr64/reduce-entries [row col e] [mapped row-start row-end] [slot 0]
+      (aset row-ids slot (int row))
+      (aset col-ids slot (int col))
+      (csr/csr-copy-block! mapped e values (* slot dim))
+      (inc slot))))
+```
+
 `reduce-entries` binds `row`, `col` and the entry id `e` as primitive longs, in
 `csr-scan-ranges!` order, and expands to one flat loop over the entries of the
-range; `[mapped]` alone covers every row. `lane` reads lane `k` of an entry
-with index checks. The source, the bounds and `init` are evaluated once, and an
-invalid row range throws `ex-info`. A primitive `init` and body keep `acc`
-unboxed, so nothing is copied or allocated per entry; any other body still
-works, but boxes. The reduction borrows the source rather than a buffer: the
-bound values are plain numbers, but the source must stay open until the call
-returns, and reading a closed source throws the JDK's `IllegalStateException`.
-The body sits in expression position, where Clojure compiles an inner `loop` or
-`dotimes` into a closure that allocates and boxes: put multi-lane work in a
-primitive-typed helper such as `(defn dot ^double [src ^long e ^doubles w] …)`
-and call it from the body. `reduced` does not stop the loop; use `pages` to
-stop early.
+range; `[mapped]` alone covers every row. `lane` reads lane `k` of an entry with
+index checks. A direct `lane` call expands at compile time into that checked
+read, so redefining `lane` does not reach callers compiled earlier; `apply` and
+higher-order use still call the function. The source, the bounds and `init` are
+evaluated once, and an invalid row range throws `ex-info`. A primitive `init`
+and body keep `acc` unboxed, so the loop allocates nothing per entry; any other
+body still works, but boxes. The reduction borrows the source rather than a
+buffer: the bound values are plain numbers, but the source must stay open until
+the call returns, and reading a closed source throws the JDK's
+`IllegalStateException`. The body sits in expression position, where Clojure
+compiles an inner `loop` or `dotimes` into a closure that allocates and boxes:
+put multi-lane work in a primitive-typed helper such as
+`(defn dot ^double [src ^long e ^doubles w] …)` and call it from the body.
+`reduced` does not stop the loop; use `pages` to stop early.
 
 `copy-page!` is the primitive under `pages`, for callers owning their arrays. It
 counts the selected range before writing, validates every destination capacity,
@@ -339,6 +357,8 @@ that to the cursor for the next page. An empty range or an exhausted cursor
 returns `0` without writing, as the compiled overlay does.
 `find-entry` and `copy-point!` provide numeric point lookup. `copy-point!`, here
 and on compiled overlays, returns `dst`, or nil when the coordinate is absent.
+Without `dst-off` it copies to offset 0; on a mapped source this arity takes
+primitive `long` ids, so, unlike the five-argument arity, it does not box them.
 `load!` requests best-effort residency from the operating system, while
 `loaded?` exposes the corresponding point-in-time hint.
 
@@ -600,7 +620,7 @@ destinations through seven contenders:
 - a preloaded Java 25 `MemorySegment` CSR64 artifact, read three ways: one
   `copy-page!` call (`csr64`), a `pages` drain through a reusable 4,096-entry
   `page` copied out page by page (`csr64-pages`), and `reduce-entries` copying
-  each block one `lane` read at a time (`csr64-reduce-entries`);
+  each block with one `csr-copy-block!` call (`csr64-reduce-entries`);
 - `csr-copy-ranges!` on a Parquet-derived `CSRSource`;
 - the same source's generic per-edge visitor;
 - Yogthos [Flatiron](https://github.com/yogthos/flatiron)'s graph CSR with a block sidecar;

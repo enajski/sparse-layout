@@ -637,44 +637,46 @@
         {:dst-off dst-off :block-dim (p/csr-block-dim source) :capacity (alength ^doubles dst)}))))
 
 (defn copy-point!
-  "Copies the visible block for one numeric coordinate; returns `dst`, or nil when absent."
-  [^CSR64LedgerOverlay overlay row-id col-id ^doubles dst dst-off]
-  (let [source
-        (.-base overlay)
+  "Copies the visible block for one numeric coordinate; returns `dst`, or nil when absent.
+  Without `dst-off`, copies to offset 0."
+  ([overlay row-id col-id dst] (copy-point! overlay row-id col-id dst 0))
+  ([^CSR64LedgerOverlay overlay row-id col-id ^doubles dst dst-off]
+   (let [source
+         (.-base overlay)
 
-        row-id
-        (id! :row-id row-id (p/csr-row-count source) nil)
+         row-id
+         (id! :row-id row-id (p/csr-row-count source) nil)
 
-        col-id
-        (id! :col-id col-id (p/csr-col-count source) nil)
+         col-id
+         (id! :col-id col-id (p/csr-col-count source) nil)
 
-        structural-patches
-        ^objects (.-structuralPatches overlay)
+         structural-patches
+         ^objects (.-structuralPatches overlay)
 
-        value-entry-ids
-        ^longs (.-valueEntryIds overlay)
+         value-entry-ids
+         ^longs (.-valueEntryIds overlay)
 
-        value-blocks
-        ^objects (.-valueBlocks overlay)]
+         value-blocks
+         ^objects (.-valueBlocks overlay)]
 
-    (ensure-point-destination! source dst dst-off)
-    (let [structural-idx (structural-index overlay row-id)]
-      (if (not= -1 structural-idx)
-        (if-let [{:keys [op block]} (patch-entry (aget structural-patches (int structural-idx))
-                                                 col-id)]
-          (when (= :put op)
-            (System/arraycopy ^doubles block 0 dst (int dst-off) (int (p/csr-block-dim source)))
-            dst)
-          (csr64/copy-point! source row-id col-id dst dst-off))
-        (let [entry-id (csr64/find-entry source row-id col-id)]
-          (when-not (= -1 entry-id)
-            (let [idx (lower-bound-long value-entry-ids entry-id)]
-              (if (and (< idx (alength value-entry-ids))
-                       (= entry-id (aget value-entry-ids (int idx))))
-                (do (System/arraycopy ^doubles (aget value-blocks (int idx))
-                                      0
-                                      dst
-                                      (int dst-off)
-                                      (int (p/csr-block-dim source)))
-                    dst)
-                (csr64/copy-point! source row-id col-id dst dst-off)))))))))
+     (ensure-point-destination! source dst dst-off)
+     (let [structural-idx (structural-index overlay row-id)]
+       (if (not= -1 structural-idx)
+         (if-let [{:keys [op block]} (patch-entry (aget structural-patches (int structural-idx))
+                                                  col-id)]
+           (when (= :put op)
+             (System/arraycopy ^doubles block 0 dst (int dst-off) (int (p/csr-block-dim source)))
+             dst)
+           (csr64/copy-point! source row-id col-id dst dst-off))
+         (let [entry-id (csr64/find-entry source row-id col-id)]
+           (when-not (= -1 entry-id)
+             (let [idx (lower-bound-long value-entry-ids entry-id)]
+               (if (and (< idx (alength value-entry-ids))
+                        (= entry-id (aget value-entry-ids (int idx))))
+                 (do (System/arraycopy ^doubles (aget value-blocks (int idx))
+                                       0
+                                       dst
+                                       (int dst-off)
+                                       (int (p/csr-block-dim source)))
+                     dst)
+                 (csr64/copy-point! source row-id col-id dst dst-off))))))))))

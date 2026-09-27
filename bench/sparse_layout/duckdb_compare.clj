@@ -3,8 +3,8 @@
 
   Every timed path copies the same selected edges into caller-owned primitive
   arrays allocated before timing. Mapped CSR64 is read through `copy-page!`, a
-  `pages` drain, and `reduce-entries` with `lane`. Parquet generation and CSR
-  construction are reported separately."
+  `pages` drain, and `reduce-entries` with one `csr-copy-block!` per entry. Parquet
+  generation and CSR construction are reported separately."
   (:gen-class)
   (:require [clojure.string :as str]
             [sparse-layout.bench-data :as data]
@@ -290,20 +290,6 @@
 
     #(reduce append-page 0 (csr64/pages source start-row end-row buf))))
 
-(defn- copy-lanes!
-  "Copies entry `entry-id`'s block into block slot `slot` of `values`, one `csr64/lane` read
-  per double; returns the next slot."
-  ^long [source ^long entry-id ^doubles values ^long slot]
-  (let [dim
-        (csr64/block-dim source)
-
-        offset
-        (* slot dim)]
-
-    (dotimes [k dim]
-      (aset values (+ offset k) (csr64/lane source entry-id k)))
-    (inc slot)))
-
 (defn- csr64-reduce-entries-runner
   [source ^long start-row ^long end-row destination]
   (let [rows
@@ -313,14 +299,18 @@
         ^ints (:cols destination)
 
         values
-        ^doubles (:values destination)]
+        ^doubles (:values destination)
+
+        dim
+        (csr64/block-dim source)]
 
     #(csr64/reduce-entries [row col e]
                            [source start-row end-row]
                            [slot 0]
                            (aset rows slot (int row))
                            (aset cols slot (int col))
-                           (copy-lanes! source e values slot))))
+                           (csr/csr-copy-block! source e values (* slot dim))
+                           (inc slot))))
 
 (defn- parquet-query
   [^Path path projection]

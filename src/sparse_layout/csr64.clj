@@ -702,7 +702,36 @@
   (.-values page))
 
 (defn lane
-  "Returns lane `k` of entry `entry-id`'s block, read from the mapping."
+  "Returns lane `k` of entry `entry-id`'s block, read from the mapping.
+
+  A direct three-argument call expands at compile time into the same checked read, so it
+  does not go through the var; `apply` and higher-order use call this function."
+  {:inline (fn [source entry-id k]
+             `(let [^CSR64Source source#
+                    ~source
+
+                    entry-id#
+                    (long ~entry-id)
+
+                    k#
+                    (long ~k)
+
+                    entry-count#
+                    (.-entryCount source#)
+
+                    dim#
+                    (.-blockDim source#)]
+
+                (when (or (neg? entry-id#) (>= entry-id# entry-count#))
+                  (throw (ex-info "CSR64 index is out of bounds."
+                                  {:index :entry-id :value entry-id# :upper-bound entry-count#})))
+                (when (or (neg? k#) (>= k# dim#))
+                  (throw (ex-info "CSR64 index is out of bounds."
+                                  {:index :lane :value k# :upper-bound dim#})))
+                (.getAtIndex ^MemorySegment (.-payload source#)
+                             ValueLayout/JAVA_DOUBLE_UNALIGNED
+                             (+ (* entry-id# dim#) k#))))
+   :inline-arities #{3}}
   ^double [^CSR64Source source ^long entry-id ^long k]
   (let [dim (.-blockDim source)]
     (.getAtIndex ^MemorySegment (.-payload source)
@@ -739,7 +768,16 @@
   body keep `acc` unboxed, and any other body still works, but boxes. The body sits in
   expression position, where an inner `loop` or `dotimes` compiles into a closure; put
   multi-lane work in a primitive-typed helper and call it from the body. `reduced` does not
-  stop the loop. The source must stay open until the call returns."
+  stop the loop. The source must stay open until the call returns.
+
+  Read single lanes with `lane`. To copy whole blocks, call
+  `sparse-layout.csr-source/csr-copy-block!` once per entry instead of `lane` once per double:
+
+    (reduce-entries [row col e] [src row-start row-end] [slot 0]
+      (aset row-ids slot (int row))
+      (aset col-ids slot (int col))
+      (csr-copy-block! src e values (* slot block-dim))
+      (inc slot))"
   [entry-bindings range-bindings acc-bindings & body]
   (ensure-reduce-entries-form! entry-bindings range-bindings acc-bindings)
   (let [[row col e]
@@ -819,30 +857,33 @@
 (defn find-entry
   "Returns the entry id for a numeric row/column coordinate, or -1."
   ^long [^CSR64Source source ^long row-id ^long col-id]
-  (let [row-id
-        (ensure-index! :row-id row-id (.-rowCount source))
+  (let [row-count
+        (.-rowCount source)
 
-        col-id
-        (ensure-index! :col-id col-id (.-colCount source))
+        col-count
+        (.-colCount source)
 
-        row-ptrs
+        ^MemorySegment row-ptrs
         (.-rowPtrs source)
 
-        col-ids
+        ^MemorySegment col-ids
         (.-colIds source)]
 
+    (when (or (neg? row-id) (>= row-id row-count) (neg? col-id) (>= col-id col-count))
+      (ensure-index! :row-id row-id row-count)
+      (ensure-index! :col-id col-id col-count))
     (loop [low
-           (row-ptr row-ptrs row-id)
+           (.getAtIndex row-ptrs ValueLayout/JAVA_LONG_UNALIGNED row-id)
 
            high
-           (dec (row-ptr row-ptrs (inc row-id)))]
+           (dec (.getAtIndex row-ptrs ValueLayout/JAVA_LONG_UNALIGNED (inc row-id)))]
 
       (if (<= low high)
         (let [middle
               (quot (+ low high) 2)
 
               actual
-              (entry-col col-ids middle)]
+              (long (.getAtIndex col-ids ValueLayout/JAVA_INT_UNALIGNED middle))]
 
           (cond (< actual col-id) (recur (inc middle) high)
                 (> actual col-id) (recur low (dec middle))
@@ -850,16 +891,28 @@
         -1))))
 
 (defn copy-point!
-  "Copies one numeric coordinate into `dst`; returns `dst`, or nil when absent."
-  [^CSR64Source source row-id col-id ^doubles dst dst-off]
-  (let [entry-id (find-entry source row-id col-id)]
-    (when-not (= -1 entry-id)
-      (copy-block-fields! (.-payload source)
-                          (.-entryCount source)
-                          (.-blockDim source)
-                          entry-id
-                          dst
-                          dst-off))))
+  "Copies one numeric coordinate into `dst`; returns `dst`, or nil when absent.
+
+  Without `dst-off`, copies to offset 0. That arity takes primitive long ids, so a direct call
+  with long ids does not box them."
+  ([^CSR64Source source ^long row-id ^long col-id ^doubles dst]
+   (let [entry-id (find-entry source row-id col-id)]
+     (when-not (= -1 entry-id)
+       (copy-block-fields! (.-payload source)
+                           (.-entryCount source)
+                           (.-blockDim source)
+                           entry-id
+                           dst
+                           0))))
+  ([^CSR64Source source row-id col-id ^doubles dst dst-off]
+   (let [entry-id (find-entry source row-id col-id)]
+     (when-not (= -1 entry-id)
+       (copy-block-fields! (.-payload source)
+                           (.-entryCount source)
+                           (.-blockDim source)
+                           entry-id
+                           dst
+                           dst-off)))))
 
 (defn load!
   "Best-effort preload of every mapped CSR64 section."
