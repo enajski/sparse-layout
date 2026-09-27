@@ -255,6 +255,128 @@ The source layer can also persist fixed-double-block CSR sources to a language-n
 
 The v1 artifact is a single little-endian binary file with a fixed header, section table, primitive CSR sections, payload doubles, and typed row/column key dictionaries. Readers validate the section table, CSR row pointers, column ids, and key dictionaries on open, throwing `ex-info` for corrupt artifacts. They rebuild key lookup maps on open while keeping row pointers, column ids, and payload values mmap-backed. The current JVM reader maps the artifact as one `ByteBuffer`, so files must be smaller than `Integer/MAX_VALUE`; the mapping is GC-managed and remains live while the returned source is reachable.
 
+### CSR64 MemorySegment API
+
+Java 25 callers can use `sparse-layout.csr64` when the payload exceeds the v1
+single-`ByteBuffer` limit. The v2 numeric artifact stores 64-bit row pointers,
+32-bit column ids, and fixed-width doubles in separate file-backed
+`MemorySegment` regions. It deliberately omits key dictionaries and prefix
+indexes: logical keys must be resolved to snapshot-local numeric ids before the
+hot call.
+
+The repository includes an SDKMAN environment file for Amazon Corretto 25:
+
+```sh
+sdk env
+```
+
+Write and open a v2 artifact from any existing `CSRSource`:
+
+```clojure
+(require '[sparse-layout.csr64 :as csr64])
+
+(csr64/write-artifact! source "/tmp/features.slcsr64")
+
+(with-open [mapped (csr64/open-artifact "/tmp/features.slcsr64")]
+  (let [capacity 1024
+        rows (int-array capacity)
+        cols (int-array capacity)
+        values (double-array (* capacity (csr/csr-block-dim mapped)))]
+    ;; cursor is the number of entries already consumed from rows [0, 64).
+    (csr64/copy-page! mapped 0 64 0 capacity rows cols values 0)))
+```
+
+`copy-page!` counts the selected range before writing, validates every
+destination capacity, and copies at most `max-entries`. A nonempty page returns
+the number of copied entries; add that to the cursor for the next page.
+**Known defect:** the current base returns `nil` for an empty range or exhausted
+cursor, where the intended contract is `0`. Stop at `range-entry-count` until
+this is fixed. The compiled overlay already returns `0`. `find-entry` and
+`copy-point!` provide numeric point lookup. `load!` requests best-effort
+residency from the operating system, while `loaded?` exposes the corresponding
+point-in-time hint.
+
+Rows must contain strictly increasing, unique column IDs. The current opener
+checks column bounds but does not establish that ordering; malformed artifacts
+can produce incorrect point and overlay results. Write new generations to fresh,
+unpublished paths: the writer truncates an existing target. Keep a generation
+alive across every page, with distinct row/column arrays owned by the caller.
+
+Run the matched heap/CSR64 benchmark with:
+
+```sh
+clojure -M:csr64-bench
+clojure -M:csr64-bench ceiling
+```
+
+The local ARM64 macOS run on Corretto 25.0.4 used 100 samples per selection and
+reported:
+
+| Shape / backend | Selection | Payload | median | p99 | allocation/call |
+|---|---:|---:|---:|---:|---:|
+| medium / CSR64 | 262,144 entries | 590 MiB | 19.360 ms | 20.788 ms | 192 B |
+| medium / heap CSR | 262,144 entries | 590 MiB | 18.621 ms | 21.711 ms | 400 B |
+| ceiling / CSR64 | one row, 255 entries | 588 KiB | 0.018 ms | 0.023 ms | 216 B |
+| ceiling / CSR64 | 64 rows, 16,320 entries | 36.7 MiB | 1.301 ms | 1.534 ms | 216 B |
+| ceiling / CSR64 | final 226,695 entries | 510 MiB | 16.546 ms | 18.061 ms | 216 B |
+
+The ceiling artifact contained 2,147,448,075 doubles across 7,279,485 entries:
+15.9997 GiB of payload and 16.0271 GiB on disk. It wrote in 6.254 seconds,
+opened and structurally validated in 98.6 ms, and preloaded in 1.501 seconds.
+These warm-cache p99 values prove the local implementation gate, not a cloud
+tail-latency guarantee. The benchmark intentionally pages the result rather
+than allocate or copy one maximum-length output array.
+
+### CSR64 modification-ledger overlay
+
+`sparse-layout.csr64-overlay` compiles a consistent, ordered modification-ledger
+cut into an immutable overlay. Ledger records use numeric snapshot-local IDs and
+strictly increasing sequence numbers:
+
+```clojure
+(require '[sparse-layout.csr64-overlay :as overlay])
+
+(def view
+  (overlay/compile-ledger
+    mapped
+    [{:sequence 41
+      :op :put
+      :row-id 7
+      :col-id 3
+      :block (double-array 295)}
+     {:sequence 42 :op :delete :row-id 9 :col-id 5}]))
+
+(overlay/copy-page! view 0 64 0 capacity rows cols values 0)
+```
+
+The latest record for a coordinate wins. Existing-value puts stay on a fast
+lane: CSR64 bulk-copies the base page, then patches destination blocks by base
+entry ID. Only rows containing an insert or effective delete use a sorted row
+merge. The compiled view owns copies of put blocks, is safe for concurrent
+readers, and requires its mapped base to remain open. Ledger durability and
+transaction boundaries remain the caller's responsibility.
+
+Run the medium, 295-double overlay benchmark with:
+
+```sh
+sdk env
+clojure -M:csr64-bench overlay
+```
+
+| Ledger cut over a 590 MiB base | Selection | median | p99 | allocation/call |
+|---|---:|---:|---:|---:|
+| 100,000 value replacements | one row | 0.025 ms | 0.080 ms | 1,736 B |
+| 100,000 value replacements | 64 rows | 0.140 ms | 0.324 ms | 23,192 B |
+| 100,000 value replacements | full | 42.439 ms | 46.555 ms | 5,128 B |
+| 1,000 structural rows | one row | 0.034 ms | 0.065 ms | 4,280 B |
+| 1,000 structural rows | 64 rows | 0.310 ms | 0.898 ms | 156,128 B |
+| 1,000 structural rows | full | 20.464 ms | 23.538 ms | 2,441,696 B |
+
+All used 100 samples and passed the 50 ms p99 gate locally. The 100,000-value
+case is close to the ceiling; compact to a new CSR64 generation before a larger
+ledger cut or wider page is admitted. The full design and lifecycle are in
+[`docs/csr64-modification-ledger-overlay.md`](docs/csr64-modification-ledger-overlay.md).
+
 ## Executable Documentation
 
 This repo includes a Clerk notebook at `notebooks/sparse_layout/csr_source_notebook.clj` that walks through the CSR source layer end to end: logical records, frozen CSR internals, storage-level scans, query-shaped range indexes, mutable deltas, merged rows, and the mmap backend boundary.
@@ -346,9 +468,11 @@ To analyze changes and check obligations:
 bb bridge next
 ```
 
-`deps.edn` includes test, lint, and advanced-format aliases:
+`deps.edn` includes test, lint, and advanced-format aliases. Use Java 25 through
+the checked-in SDKMAN environment before running them:
 
 ```sh
+sdk env
 clojure -M:test
 clojure -M:lint
 clojure -M:format

@@ -1,7 +1,8 @@
 (ns sparse-layout.bench
   (:gen-class)
   (:require [criterium.core :as criterium]
-            [sparse-layout.bench-data :as data]))
+            [sparse-layout.bench-data :as data]
+            [sparse-layout.csr64-bench :as csr64-bench]))
 
 (defn- run-case
   [quick? label f]
@@ -111,7 +112,8 @@
   ([configs]
    (println "sparse-layout benchmark smoke check")
    (doseq [config configs]
-     (smoke-config config))))
+     (smoke-config config))
+   (csr64-bench/smoke-check)))
 
 (defn -main
   [& args]
