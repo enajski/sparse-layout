@@ -262,7 +262,9 @@ single-`ByteBuffer` limit. The v2 numeric artifact stores 64-bit row pointers,
 32-bit column ids, and fixed-width doubles in separate file-backed
 `MemorySegment` regions. It deliberately omits key dictionaries and prefix
 indexes: logical keys must be resolved to snapshot-local numeric ids before the
-hot call.
+hot call. Files are little-endian on every host, and reading them requires a
+little-endian host (x86-64, ARM64): `open-artifact` throws `ex-info` on a
+big-endian JVM before mapping anything.
 
 The repository includes an SDKMAN environment file for Amazon Corretto 25:
 
@@ -270,31 +272,75 @@ The repository includes an SDKMAN environment file for Amazon Corretto 25:
 sdk env
 ```
 
-Write and open a v2 artifact from any existing `CSRSource`:
+Write and open a v2 artifact from any existing `CSRSource`, then drain a row
+range page by page:
 
 ```clojure
 (require '[sparse-layout.csr64 :as csr64])
 
 (csr64/write-artifact! source "/tmp/features.slcsr64")
 
+(defn lane-0-sum
+  "Sums lane 0 over the entries of one page."
+  ^double [page]
+  (let [n (count page)]
+    (loop [i 0 sum 0.0]
+      (if (< i n) (recur (inc i) (+ sum (csr64/page-lane page i 0))) sum))))
+
 (with-open [mapped (csr64/open-artifact "/tmp/features.slcsr64")]
-  (let [capacity 1024
-        rows (int-array capacity)
-        cols (int-array capacity)
-        values (double-array (* capacity (csr/csr-block-dim mapped)))]
-    ;; cursor is the number of entries already consumed from rows [0, 64).
-    (csr64/copy-page! mapped 0 64 0 capacity rows cols values 0)))
+  ;; One reusable buffer: int[1024] row and column ids and
+  ;; double[1024 × block-dim] values.
+  (let [buf (csr64/page mapped 1024)]
+    (transduce (map lane-0-sum) + 0.0 (csr64/pages mapped 0 64 buf))))
 ```
 
-`copy-page!` counts the selected range before writing, validates every
-destination capacity, and copies at most `max-entries`. A nonempty page returns
-the number of copied entries; add that to the cursor for the next page.
-**Known defect:** the current base returns `nil` for an empty range or exhausted
-cursor, where the intended contract is `0`. Stop at `range-entry-count` until
-this is fixed. The compiled overlay already returns `0`. `find-entry` and
-`copy-point!` provide numeric point lookup. `load!` requests best-effort
-residency from the operating system, while `loaded?` exposes the corresponding
-point-in-time hint.
+`pages` refills the same buffer on every step, so a page is valid only inside
+the step that receives it: summarize it there, or copy out what you keep.
+`(count page)` is the number of entries in the step. `page-row`, `page-col` and
+`page-lane` read one entry with index checks; `page-rows`, `page-cols` and
+`page-values` return the backing arrays for bulk hand-off, of which only the
+first `count` entries (`count × block-dim` values) are valid. `pages`
+implements `IReduceInit` only: `reduce`, `transduce` and `into` with a
+transducer work, while `seq` throws. Returning `reduced` stops the drain before
+the next copy. `row-count`, `col-count`, `entry-count` and `block-dim` return
+the shape as primitive longs, and printing a source or a page shows only its
+path and shape.
+
+When a reduction needs only a few lanes per entry, read the mapping instead of
+copying blocks:
+
+```clojure
+(defn weighted-lane-0
+  "Sums lane 0 over rows [row-start, row-end), weighted by column."
+  ^double [mapped ^doubles weights row-start row-end]
+  (csr64/reduce-entries [_row col e] [mapped row-start row-end] [acc 0.0]
+    (+ acc (* (aget weights col) (csr64/lane mapped e 0)))))
+```
+
+`reduce-entries` binds `row`, `col` and the entry id `e` as primitive longs, in
+`csr-scan-ranges!` order, and expands to one flat loop over the entries of the
+range; `[mapped]` alone covers every row. `lane` reads lane `k` of an entry
+with index checks. The source, the bounds and `init` are evaluated once, and an
+invalid row range throws `ex-info`. A primitive `init` and body keep `acc`
+unboxed, so nothing is copied or allocated per entry; any other body still
+works, but boxes. The reduction borrows the source rather than a buffer: the
+bound values are plain numbers, but the source must stay open until the call
+returns, and reading a closed source throws the JDK's `IllegalStateException`.
+The body sits in expression position, where Clojure compiles an inner `loop` or
+`dotimes` into a closure that allocates and boxes: put multi-lane work in a
+primitive-typed helper such as `(defn dot ^double [src ^long e ^doubles w] …)`
+and call it from the body. `reduced` does not stop the loop; use `pages` to
+stop early.
+
+`copy-page!` is the primitive under `pages`, for callers owning their arrays. It
+counts the selected range before writing, validates every destination capacity,
+and copies at most `max-entries`. It returns the number of copied entries; add
+that to the cursor for the next page. An empty range or an exhausted cursor
+returns `0` without writing, as the compiled overlay does.
+`find-entry` and `copy-point!` provide numeric point lookup. `copy-point!`, here
+and on compiled overlays, returns `dst`, or nil when the coordinate is absent.
+`load!` requests best-effort residency from the operating system, while
+`loaded?` exposes the corresponding point-in-time hint.
 
 Rows must contain strictly increasing, unique column IDs. The current opener
 checks column bounds but does not establish that ordering; malformed artifacts
@@ -551,7 +597,10 @@ The matched serving benchmark pins DuckDB 1.5.5, uses a 295-double block per
 `(row-key, col-key)` edge, and fills the same preallocated `int[]`/`double[]`
 destinations through seven contenders:
 
-- a preloaded Java 25 `MemorySegment` CSR64 artifact;
+- a preloaded Java 25 `MemorySegment` CSR64 artifact, read three ways: one
+  `copy-page!` call (`csr64`), a `pages` drain through a reusable 4,096-entry
+  `page` copied out page by page (`csr64-pages`), and `reduce-entries` copying
+  each block one `lane` read at a time (`csr64-reduce-entries`);
 - `csr-copy-ranges!` on a Parquet-derived `CSRSource`;
 - the same source's generic per-edge visitor;
 - Yogthos [Flatiron](https://github.com/yogthos/flatiron)'s graph CSR with a block sidecar;
@@ -562,8 +611,9 @@ destinations through seven contenders:
 It verifies exact output equality before timing and reports Parquet generation,
 Parquet → COO → CSR construction, CSR64 write/open/preload time, file size,
 median/p95/p99 materialization time, the 50 ms result, and current-thread JVM
-allocation. CSR64 uses 100 measured samples; the slower controls use 5–30.
-DuckDB native allocation is not included.
+allocation. Each CSR64 row uses 100 measured samples; the slower controls use
+5–30. The run exits nonzero only when the `csr64` row misses the 50 ms p99
+ceiling; the other rows just report it. DuckDB native allocation is not included.
 
 Flatiron is pinned to `fd27b76d6af097ab3211feffabda5d439ec6e4dd` in the
 benchmark-only alias. `flatiron-csr-sidecar` uses its real `graph/graph`

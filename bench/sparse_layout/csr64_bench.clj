@@ -8,7 +8,7 @@
   (:import [com.sun.management ThreadMXBean]
            [java.lang.management ManagementFactory]
            [java.nio.file Files Path]
-           [java.util Arrays HashMap]))
+           [java.util Arrays HashMap SplittableRandom]))
 
 (set! *warn-on-reflection* true)
 
@@ -535,6 +535,327 @@
                                            (structural-ledger config 1000))})
       (finally (Files/deleteIfExists path)))))
 
+(def ^:private api-lookup-count 1000000)
+
+(def ^:private api-warmup-ns 1000000000)
+
+(def ^:private api-samples 40)
+
+(def ^:private api-page-capacity 4096)
+
+(defn- lookup-coordinates
+  "Fixed-seed point coordinates; about half of them miss."
+  [{:keys [row-count col-count entries-per-row]}]
+  (let [random
+        (SplittableRandom. 20260927)
+
+        stored-cols
+        (long entries-per-row)
+
+        missing-cols
+        (- (long col-count) stored-cols)
+
+        rows
+        (long-array api-lookup-count)
+
+        cols
+        (long-array api-lookup-count)]
+
+    (dotimes [index api-lookup-count]
+      (aset rows index (.nextLong random (long row-count)))
+      (aset cols
+            index
+            (if (.nextBoolean random)
+              (.nextLong random stored-cols)
+              (+ stored-cols (.nextLong random missing-cols)))))
+    {:rows rows :cols cols}))
+
+(defn- expected-find-entry-sum
+  ^long [{:keys [entries-per-row]} ^longs rows ^longs cols]
+  (let [stored-cols (long entries-per-row)]
+    (loop [index 0
+           sum 0]
+
+      (if (< index (alength rows))
+        (let [col (aget cols index)]
+          (recur (inc index)
+                 (+ sum (if (< col stored-cols) (+ (* (aget rows index) stored-cols) col) -1))))
+        sum))))
+
+(defn- expected-hits
+  ^long [{:keys [entries-per-row]} ^longs cols]
+  (let [stored-cols (long entries-per-row)]
+    (loop [index 0
+           hits 0]
+
+      (if (< index (alength cols))
+        (recur (inc index) (if (< (aget cols index) stored-cols) (inc hits) hits))
+        hits))))
+
+(defn- find-entry-sum
+  ^long [mapped ^longs rows ^longs cols]
+  (loop [index
+         0
+
+         sum
+         0]
+
+    (if (< index (alength rows))
+      (recur (inc index) (+ sum (csr64/find-entry mapped (aget rows index) (aget cols index))))
+      sum)))
+
+(defn- copy-point-hits
+  ^long [mapped ^longs rows ^longs cols ^doubles dst]
+  (loop [index
+         0
+
+         hits
+         0]
+
+    (if (< index (alength rows))
+      (recur
+        (inc index)
+        (if (csr64/copy-point! mapped (aget rows index) (aget cols index) dst 0) (inc hits) hits))
+      hits)))
+
+(defn- open-entry-count
+  ^long [path]
+  (with-open [source (csr64/open-artifact path)]
+    (csr64/range-entry-count source 0 (:row-count (csr64/metadata source)))))
+
+(defn- expected-drain-sum
+  "Sum of row id plus column id over every entry of the uniform layout."
+  ^long [{:keys [row-count entries-per-row]}]
+  (let [rows
+        (long row-count)
+
+        per-row
+        (long entries-per-row)]
+
+    (+ (quot (* per-row rows (dec rows)) 2) (quot (* rows per-row (dec per-row)) 2))))
+
+(defn- page-id-sum
+  ^long [^ints rows ^ints cols ^long entry-count]
+  (loop [index
+         0
+
+         sum
+         0]
+
+    (if (< index entry-count) (recur (inc index) (+ sum (aget rows index) (aget cols index))) sum)))
+
+(defn- drain-copy-page-sum
+  "Drains every row with a hand-written `copy-page!` cursor loop."
+  ^long [mapped ^ints rows ^ints cols ^doubles values]
+  (let [row-end
+        (csr64/row-count mapped)
+
+        total
+        (csr64/entry-count mapped)
+
+        capacity
+        (alength rows)]
+
+    (loop [cursor
+           0
+
+           sum
+           0]
+
+      (if (< cursor total)
+        (let [copied (long (csr64/copy-page! mapped 0 row-end cursor capacity rows cols values 0))]
+          (recur (+ cursor copied) (+ sum (page-id-sum rows cols copied))))
+        sum))))
+
+(defn- drain-pages-sum
+  "Drains every row by reducing over `csr64/pages`."
+  ^long [mapped buf]
+  (reduce (fn [^long sum page]
+            (+ sum (page-id-sum (csr64/page-rows page) (csr64/page-cols page) (count page))))
+          0
+          (csr64/pages mapped buf)))
+
+(defn- page-lane-0-sum
+  ^double [^doubles values ^long dim ^long entry-count]
+  (loop [index
+         0
+
+         sum
+         0.0]
+
+    (if (< index entry-count) (recur (inc index) (+ sum (aget values (* index dim)))) sum)))
+
+(defn- lane-0-copy-pages-sum
+  "Sums lane 0 of every entry by copying pages with `copy-page!`, then reading the copies."
+  ^double [mapped ^ints rows ^ints cols ^doubles values]
+  (let [row-end
+        (csr64/row-count mapped)
+
+        total
+        (csr64/entry-count mapped)
+
+        dim
+        (csr64/block-dim mapped)
+
+        capacity
+        (alength rows)]
+
+    (loop [cursor
+           0
+
+           sum
+           0.0]
+
+      (if (< cursor total)
+        (let [copied (long (csr64/copy-page! mapped 0 row-end cursor capacity rows cols values 0))]
+          (recur (+ cursor copied) (+ sum (page-lane-0-sum values dim copied))))
+        sum))))
+
+(defn- lane-0-reduce-entries-sum
+  "Sums lane 0 of every entry straight from the mapping with `csr64/reduce-entries`."
+  ^double [mapped]
+  (csr64/reduce-entries [_row _col e] [mapped] [acc 0.0] (+ acc (csr64/lane mapped e 0))))
+
+(defn- api-variants
+  [mapped path config]
+  (let [{:keys [rows cols]}
+        (lookup-coordinates config)
+
+        dst
+        (double-array (:block-dim config))
+
+        entry-count
+        (* (long (:row-count config)) (long (:entries-per-row config)))
+
+        drain-sum
+        (expected-drain-sum config)
+
+        page-rows
+        (int-array api-page-capacity)
+
+        page-cols
+        (int-array api-page-capacity)
+
+        page-values
+        (double-array (* api-page-capacity (long (:block-dim config))))]
+
+    [{:label :find-entry
+      :f #(find-entry-sum mapped rows cols)
+      :expected (expected-find-entry-sum config rows cols)}
+     {:label :copy-point
+      :f #(copy-point-hits mapped rows cols dst)
+      :expected (expected-hits config cols)}
+     {:label :open-and-validate :f #(open-entry-count path) :expected entry-count}
+     {:label :drain-copy-page
+      :f #(drain-copy-page-sum mapped page-rows page-cols page-values)
+      :expected drain-sum}
+     (let [buf (csr64/page mapped api-page-capacity)]
+       {:label :drain-pages :f #(drain-pages-sum mapped buf) :expected drain-sum})
+     {:label :lane-0-copy-pages
+      :f #(lane-0-copy-pages-sum mapped page-rows page-cols page-values)
+      :expected (double entry-count)}
+     {:label :lane-0-reduce-entries
+      :f #(lane-0-reduce-entries-sum mapped)
+      :expected (double entry-count)}]))
+
+(defn- check-api-result!
+  [label expected actual]
+  (when-not (= expected actual)
+    (throw (ex-info "CSR64 API benchmark result mismatch."
+                    {:variant label :expected expected :actual actual}))))
+
+(defn- sample-variants
+  "Warms every variant, then samples them in rotating order and checks every result."
+  [variants]
+  (doseq [{:keys [label f expected]} variants]
+    (let [deadline (+ (System/nanoTime) (long api-warmup-ns))]
+      (while (< (System/nanoTime) deadline) (check-api-result! label expected (f)))))
+  (let [variant-count
+        (count variants)
+
+        times
+        (vec (repeatedly variant-count #(long-array api-samples)))
+
+        allocations
+        (vec (repeatedly variant-count #(long-array api-samples)))]
+
+    (dotimes [sample api-samples]
+      (dotimes [offset variant-count]
+        (let [index (mod (+ sample offset) variant-count)
+              {:keys [label f expected]} (nth variants index)
+              before-bytes (allocated-bytes)
+              start (System/nanoTime)
+              actual (f)
+              elapsed (- (System/nanoTime) start)
+              allocated (- (allocated-bytes) before-bytes)]
+
+          (check-api-result! label expected actual)
+          (aset ^longs (nth times index) sample elapsed)
+          (aset ^longs (nth allocations index) sample allocated))))
+    (mapv (fn [variant ^longs variant-times ^longs variant-allocations]
+            (Arrays/sort variant-times)
+            (Arrays/sort variant-allocations)
+            (-> (dissoc variant :f)
+                (assoc :median-ns (aget variant-times (quot api-samples 2))
+                       :median-allocated-bytes (aget variant-allocations (quot api-samples 2)))))
+          variants
+          times
+          allocations)))
+
+(defn- print-api-results
+  [results]
+  (println (format "%-22s %10s %16s" "variant" "median ms" "alloc bytes/call"))
+  (doseq [{:keys [label median-ns median-allocated-bytes]} results]
+    (println (format "%-22s %10.3f %,16d"
+                     (name label)
+                     (/ (long median-ns) 1000000.0)
+                     median-allocated-bytes))))
+
+(defn run-api-config
+  "Measures the Clojure-facing CSR64 API against its low-level equivalents in one JVM."
+  [config]
+  (let [path (temporary-artifact)]
+    (try (csr64/write-artifact! (uniform-source config) path {:page-entries 16320})
+         (with-open [mapped (csr64/open-artifact path)]
+           (csr64/load! mapped)
+           (let [results (sample-variants (api-variants mapped path config))]
+             (println)
+             (println (str "CSR64 API / " (:label config)))
+             (println {:java (System/getProperty "java.runtime.version")
+                       :rows (:row-count config)
+                       :entries (* (long (:row-count config)) (long (:entries-per-row config)))
+                       :block-dim (:block-dim config)
+                       :lookups api-lookup-count
+                       :warmup-ms-per-variant (quot (long api-warmup-ns) 1000000)
+                       :samples api-samples
+                       :loaded-hint (csr64/loaded? mapped)})
+             (print-api-results results)
+             results))
+         (finally (Files/deleteIfExists path)))))
+
+(defn- drained-output
+  "Drains a row range through `csr64/pages` into a fresh destination."
+  [mapped row-start row-end capacity]
+  (let [dim
+        (csr64/block-dim mapped)
+
+        output
+        (destination (csr64/range-entry-count mapped row-start row-end) dim)]
+
+    (reduce (fn [^long offset page]
+              (let [copied (count page)]
+                (System/arraycopy (csr64/page-rows page) 0 (:rows output) offset copied)
+                (System/arraycopy (csr64/page-cols page) 0 (:cols output) offset copied)
+                (System/arraycopy (csr64/page-values page)
+                                  0
+                                  (:values output)
+                                  (* offset dim)
+                                  (* copied dim))
+                (+ offset copied)))
+            0
+            (csr64/pages mapped row-start row-end (csr64/page mapped capacity)))
+    output))
+
 (defn smoke-check
   []
   (let [config
@@ -559,6 +880,10 @@
              (assert (= entry-count ((runner :heap heap 4 12 entry-count expected))))
              (assert (= entry-count ((runner :csr64 mapped 4 12 entry-count actual))))
              (assert (same-output? expected actual))
+             (assert (same-output? expected (drained-output mapped 4 12 5)))
+             (assert
+               (= (mapv vector (:rows expected) (:cols expected))
+                  (csr64/reduce-entries [row col _e] [mapped 4 12] [acc []] (conj acc [row col]))))
              (Arrays/fill replacement 2.0)
              (let [view (overlay/compile-ledger
                           mapped
@@ -582,4 +907,5 @@
   [& args]
   (cond (some #{"smoke"} args) (smoke-check)
         (some #{"overlay"} args) (run-overlay-config (:medium configs))
+        (some #{"api"} args) (run-api-config (:medium configs))
         :else (run-config (if (some #{"ceiling"} args) (:ceiling configs) (:medium configs)))))

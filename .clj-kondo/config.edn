@@ -1,3 +1,4 @@
 {:hooks
  {:analyze-call
-  {sparse-layout.core/defsparse hooks.sparse-layout.core/defsparse}}}
+  {sparse-layout.core/defsparse hooks.sparse-layout.core/defsparse
+   sparse-layout.csr64/reduce-entries hooks.sparse-layout.csr64/reduce-entries}}}

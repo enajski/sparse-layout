@@ -4,7 +4,8 @@
             [sparse-layout.csr-source :as csr]
             [sparse-layout.csr64 :as csr64]
             [sparse-layout.csr64-overlay :as overlay])
-  (:import [java.nio.file Files Path]
+  (:import [java.nio ByteOrder]
+           [java.nio.file Files Path]
            [java.util Arrays]))
 
 (defsparse csr64-features
@@ -21,6 +22,20 @@
        {:row 3 :vals (array-map 1 [13.0 14.0 15.0])}]
       csr64-features-compile
       csr/dataset->csr-source))
+
+(defn- gapped-source
+  "Four rows with block dim 2; rows 1 and 3 hold no entries."
+  []
+  (csr/->HeapCSRSource {0 0 1 1 2 2 3 3}
+                       (object-array [0 1 2 3])
+                       {0 0 1 1 2 2}
+                       (object-array [0 1 2])
+                       (int-array [0 1 1 3 3])
+                       (int-array [1 0 2])
+                       (double-array [1.0 2.0 3.0 4.0 5.0 6.0])
+                       2
+                       nil
+                       nil))
 
 (defn- temp-artifact
   ^Path []
@@ -49,6 +64,55 @@
 
     (csr/csr-copy-ranges! source [[0 4]] rows cols values 0)
     {:rows (vec rows) :cols (vec cols) :values (vec values)}))
+
+(defn- copied-rows
+  [source row-start row-end]
+  (let [entry-count
+        (csr64/range-entry-count source row-start row-end)
+
+        rows
+        (int-array entry-count)
+
+        cols
+        (int-array entry-count)
+
+        values
+        (double-array (* entry-count (csr64/block-dim source)))]
+
+    (csr/csr-copy-ranges! source [[row-start row-end]] rows cols values 0)
+    {:rows (vec rows) :cols (vec cols) :values (vec values)}))
+
+(defn- drained
+  "Rebuilds every entry a reduce over `reducible` hands out, through the page accessors."
+  [block-dim reducible]
+  (reduce (fn [acc page]
+            (reduce (fn [{:keys [rows cols values]} i]
+                      {:rows (conj rows (csr64/page-row page i))
+                       :cols (conj cols (csr64/page-col page i))
+                       :values (into values (map #(csr64/page-lane page i %) (range block-dim)))})
+                    acc
+                    (range (count page))))
+          {:rows [] :cols [] :values []}
+          reducible))
+
+(defn- scanned
+  "Every (row col e) triple `csr-scan-ranges!` visits over `ranges`."
+  [source ranges]
+  (let [triples (atom [])]
+    (csr/csr-scan-ranges! source
+                          ranges
+                          (fn [row col e _]
+                            (swap! triples conj [row col e])))
+    @triples))
+
+(defn- block-sum
+  "Sums every lane of entry `e` through `csr64/lane`."
+  ^double [source ^long e]
+  (let [dim (csr64/block-dim source)]
+    (loop [k 0
+           sum 0.0]
+
+      (if (< k dim) (recur (inc k) (+ sum (csr64/lane source e k))) sum))))
 
 (deftest roundtrips-through-long-addressed-memory-segments
   (let [heap
@@ -102,15 +166,51 @@
                            (csr64/copy-page! mapped 0 2 0 3 rows (int-array 1) (double-array 3) 0)))
                      (is (= [-1] (vec rows)))))))
 
+(deftest empty-pages-return-zero-without-writing
+  (with-artifact (test-source)
+                 (fn [_ mapped]
+                   (let [rows
+                         (int-array 2 -1)
+
+                         cols
+                         (int-array 2 -1)
+
+                         values
+                         (double-array 6 -1.0)]
+
+                     (is (= 0 (csr64/copy-page! mapped 2 2 0 2 rows cols values 0)))
+                     (is (= 0 (csr64/copy-page! mapped 0 4 5 2 rows cols values 0)))
+                     (is (= [-1 -1] (vec rows) (vec cols)))
+                     (is (= (repeat 6 -1.0) (vec values)))))))
+
 (deftest performs-binary-searched-point-copies
   (with-artifact (test-source)
                  (fn [_ mapped]
                    (let [values (double-array 5)]
                      (is (= 1 (csr64/find-entry mapped 0 1)))
-                     (is (true? (csr64/copy-point! mapped 0 1 values 2)))
+                     (is (identical? values (csr64/copy-point! mapped 0 1 values 2)))
                      (is (= [0.0 0.0 4.0 5.0 6.0] (vec values)))
                      (is (= -1 (csr64/find-entry mapped 1 1)))
                      (is (nil? (csr64/copy-point! mapped 1 1 values 0)))))))
+
+(deftest point-reads-reject-out-of-range-ids
+  (with-artifact (test-source)
+                 (fn [_ mapped]
+                   (let [values (double-array 3)]
+                     (doseq [[row-id col-id] [[-1 0] [4 0] [0 -1] [0 2]]]
+                       (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                             #"out of bounds"
+                                             (csr64/find-entry mapped row-id col-id)))
+                       (is (thrown-with-msg?
+                             clojure.lang.ExceptionInfo
+                             #"out of bounds"
+                             (csr64/copy-point! mapped row-id col-id values 0))))))))
+
+(deftest reading-requires-a-little-endian-host
+  (is (nil? (#'csr64/ensure-little-endian-host! ByteOrder/LITTLE_ENDIAN)))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                        #"little-endian"
+                        (#'csr64/ensure-little-endian-host! ByteOrder/BIG_ENDIAN))))
 
 (deftest rejects-invalid-page-requests
   (with-artifact (test-source)
@@ -137,6 +237,212 @@
                              clojure.lang.ExceptionInfo
                              #"row range"
                              (csr64/copy-page! mapped -1 1 0 1 rows cols values 0))))))))
+
+(deftest drains-row-ranges-through-reusable-pages
+  (with-artifact
+    (test-source)
+    (fn [_ mapped]
+      (is (= [4 2 5 3]
+             ((juxt csr64/row-count csr64/col-count csr64/entry-count csr64/block-dim) mapped)))
+      (doseq [[row-start row-end]
+              [[0 4] [1 3] [2 2]]
+
+              capacity
+              [1 2 5 8]]
+
+        (testing (pr-str [row-start row-end capacity])
+          (is (= (copied-rows mapped row-start row-end)
+                 (drained 3 (csr64/pages mapped row-start row-end (csr64/page mapped capacity)))))))
+      (is (= (copied-rows mapped 0 4) (drained 3 (csr64/pages mapped (csr64/page mapped 2)))))
+      (is (= 5 (transduce (map count) + 0 (csr64/pages mapped (csr64/page mapped 2)))))))
+  (with-artifact (gapped-source)
+                 (fn [_ mapped]
+                   (doseq [capacity [1 2 3]]
+                     (is (= (copied-rows mapped 0 4)
+                            (drained 2 (csr64/pages mapped (csr64/page mapped capacity)))))))))
+
+(deftest reduced-stops-the-drain-before-the-next-copy
+  (with-artifact (test-source)
+                 (fn [_ mapped]
+                   (let [buf
+                         (csr64/page mapped 2)
+
+                         calls
+                         (atom 0)]
+
+                     (is (= :stopped
+                            (reduce (fn [_ _]
+                                      (swap! calls inc)
+                                      (reduced :stopped))
+                                    nil
+                                    (csr64/pages mapped buf))))
+                     (is (= 1 @calls))
+                     (is (= 2 (count buf)))
+                     (is (= [0 0] (vec (csr64/page-rows buf))))
+                     (is (= [0 1] (vec (csr64/page-cols buf))))
+                     (is (= [1.0 2.0 3.0 4.0 5.0 6.0] (vec (csr64/page-values buf))))))))
+
+(deftest pages-validate-their-arguments
+  (with-artifact
+    (test-source)
+    (fn [_ mapped]
+      (let [buf (csr64/page mapped 2)]
+        (testing "row range"
+          (doseq [[row-start row-end] [[-1 2] [3 2] [0 5]]]
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                  #"row range"
+                                  (csr64/pages mapped row-start row-end buf)))))
+        (testing "block dim"
+          (with-artifact (gapped-source)
+                         (fn [_ gapped]
+                           (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                                 #"block dim"
+                                                 (csr64/pages mapped (csr64/page gapped 2))))
+                           (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                                 #"block dim"
+                                                 (csr64/pages gapped buf))))))
+        (testing "capacity"
+          (doseq [capacity [0 -1 (inc (quot Integer/MAX_VALUE 3)) Long/MAX_VALUE]]
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                  #"capacity"
+                                  (csr64/page mapped capacity)))))
+        (testing "seq" (is (thrown? IllegalArgumentException (seq (csr64/pages mapped buf)))))))))
+
+(deftest page-accessors-reject-out-of-range-indexes
+  (with-artifact
+    (test-source)
+    (fn [_ mapped]
+      (let [buf (csr64/page mapped 2)]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"out of bounds" (csr64/page-row buf 0)))
+        (reduce (fn [_ _]
+                  (reduced nil))
+                nil
+                (csr64/pages mapped buf))
+        (doseq [i [-1 2]]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"out of bounds" (csr64/page-row buf i)))
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"out of bounds" (csr64/page-col buf i)))
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                #"out of bounds"
+                                (csr64/page-lane buf i 0))))
+        (doseq [k [-1 3]]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                #"out of bounds"
+                                (csr64/page-lane buf 1 k))))
+        (is (= 6.0 (csr64/page-lane buf 1 2)))))))
+
+(deftest prints-only-the-shape
+  (with-artifact
+    (test-source)
+    (fn [path mapped]
+      (let [shape
+            (str "{:path "
+                 (pr-str (str path))
+                 ", :row-count 4, :col-count 2, :entry-count 5, :block-dim 3, :open? ")
+
+            closed
+            (with-open [source (csr64/open-artifact path)]
+              source)]
+
+        (is (= (str "#object[sparse_layout.csr64.CSR64Source " shape "true}]") (pr-str mapped)))
+        (is (= (str "#object[sparse_layout.csr64.CSR64Source " shape "false}]") (pr-str closed)))
+        (is (= "#object[sparse_layout.csr64.Page {:count 0, :capacity 8, :block-dim 3}]"
+               (pr-str (csr64/page mapped 8))))))))
+
+(deftest reduces-entries-in-scan-order
+  (doseq [[source whole] [[(test-source) [[0 0 0] [0 1 1] [1 0 2] [2 0 3] [3 1 4]]]
+                          [(gapped-source) [[0 1 0] [2 0 1] [2 2 2]]]]]
+    (with-artifact
+      source
+      (fn [_ mapped]
+        (doseq [[row-start row-end] [[0 4] [1 3] [2 2]]]
+          (testing (pr-str [row-start row-end])
+            (is (= (scanned mapped [[row-start row-end]])
+                   (csr64/reduce-entries [row col e]
+                                         [mapped row-start row-end]
+                                         [acc []]
+                                         (conj acc [row col e]))))))
+        (is (= whole
+               (scanned mapped [[0 4]])
+               (csr64/reduce-entries [row col e] [mapped] [acc []] (conj acc [row col e]))))))))
+
+(deftest lanes-read-the-copied-values
+  (doseq [source [(test-source) (gapped-source)]]
+    (with-artifact source
+                   (fn [_ mapped]
+                     (let [values (:values (copied-rows mapped 0 4))]
+                       (is (= values
+                              (vec (for [e (range (csr64/entry-count mapped))
+                                         k (range (csr64/block-dim mapped))]
+
+                                     (csr64/lane mapped e k)))))
+                       (is (= (reduce + values)
+                              (csr64/reduce-entries [_row _col e]
+                                                    [mapped]
+                                                    [acc 0.0]
+                                                    (+ acc (block-sum mapped e))))))))))
+
+(deftest reduce-entries-evaluates-its-arguments-once
+  (with-artifact
+    (test-source)
+    (fn [_ mapped]
+      (let [calls
+            (atom [])
+
+            track
+            (fn [label value]
+              (swap! calls conj label)
+              value)]
+
+        (is (= 2
+               (csr64/reduce-entries [_row _col _e]
+                                     [(track :src mapped) (track :row-start 1) (track :row-end 3)]
+                                     [acc (track :init 0)]
+                                     (inc acc))))
+        (is (= [:src :row-start :row-end :init] @calls))
+        (testing "invalid ranges throw before init"
+          (doseq [[row-start row-end] [[-1 2] [3 2] [0 5]]]
+            (reset! calls [])
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                  #"row range"
+                                  (csr64/reduce-entries [_row _col _e]
+                                                        [mapped row-start row-end]
+                                                        [acc (track :init 0)]
+                                                        (inc acc))))
+            (is (= [] @calls))))
+        (testing "malformed bindings"
+          (doseq [form ['(sparse-layout.csr64/reduce-entries [row col] [src] [acc 0] acc)
+                        '(sparse-layout.csr64/reduce-entries [row col e] [src 0] [acc 0] acc)
+                        '(sparse-layout.csr64/reduce-entries [row col e] [src] [acc] acc)]]
+            (let [cause (try (macroexpand-1 form)
+                             (catch clojure.lang.Compiler$CompilerException e (ex-cause e)))]
+              (is (instance? clojure.lang.ExceptionInfo cause))
+              (is (re-find #"reduce-entries expects" (str (ex-message cause)))))))))))
+
+(deftest lane-rejects-out-of-range-indexes
+  (with-artifact
+    (test-source)
+    (fn [path mapped]
+      (doseq [e [-1 5]]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"out of bounds" (csr64/lane mapped e 0))))
+      (doseq [k [-1 3]]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"out of bounds" (csr64/lane mapped 4 k))))
+      (is (= 15.0 (csr64/lane mapped 4 2)))
+      (testing "closed source"
+        (let [closed (with-open [source (csr64/open-artifact path)]
+                       source)]
+          (is (thrown? IllegalStateException (csr64/lane closed 0 0)))
+          (is (thrown? IllegalStateException
+                       (csr64/reduce-entries [_row _col _e] [closed] [acc 0] (inc acc)))))))))
+
+(deftest reduce-entries-compiles-without-reflection-or-boxing
+  (let [warnings (java.io.StringWriter.)]
+    (binding [*err* warnings]
+      (load "/sparse_layout/csr64_probe"))
+    (is (= "" (str warnings)))
+    (with-artifact (test-source)
+                   (fn [_ mapped]
+                     (is (= 35.0 ((resolve 'sparse-layout.csr64-probe/lane-0-sum) mapped)))
+                     (is (= 3 ((resolve 'sparse-layout.csr64-probe/row-col-sum) mapped 1 3)))))))
 
 (defn- ledger-fixture
   [replacement]
@@ -236,15 +542,20 @@
         (is (= 2 (overlay/copy-page! view 0 4 3 8 rows cols values 0)))
         (is (= [3 3] (subvec (vec rows) 0 2)))
         (is (= [0 1] (subvec (vec cols) 0 2)))
-        (is (true? (overlay/copy-point! view 0 1 point 0)))
+        (is (identical? point (overlay/copy-point! view 0 1 point 0)))
         (is (= [40.0 41.0 42.0] (vec point)))
+        (is (identical? point (overlay/copy-point! view 0 0 point 0)))
+        (is (= [1.0 2.0 3.0] (vec point)))
         (is (nil? (overlay/copy-point! view 1 0 point 0)))
-        (is (true? (overlay/copy-point! view 1 1 point 0)))
+        (is (identical? point (overlay/copy-point! view 1 1 point 0)))
         (is (= [70.0 71.0 72.0] (vec point)))
-        (is (true? (overlay/copy-point! view 3 0 point 0)))
+        (is (nil? (overlay/copy-point! view 2 1 point 0)))
+        (is (identical? point (overlay/copy-point! view 3 0 point 0)))
         (is (= [90.0 91.0 92.0] (vec point)))
-        (is (true? (overlay/copy-point! view 3 1 point 0)))
-        (is (= [13.0 14.0 15.0] (vec point)))))))
+        (is (identical? point (overlay/copy-point! view 3 1 point 0)))
+        (is (= [13.0 14.0 15.0] (vec point)))
+        (testing "an absent coordinate in a row without structural patches"
+          (is (nil? (overlay/copy-point! (overlay/compile-ledger mapped []) 1 1 point 0))))))))
 
 (deftest ledger-overlay-resumes-bulk-copy-after-a-structural-row
   (with-artifact (test-source)

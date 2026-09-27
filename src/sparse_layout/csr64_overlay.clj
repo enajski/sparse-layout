@@ -637,7 +637,7 @@
         {:dst-off dst-off :block-dim (p/csr-block-dim source) :capacity (alength ^doubles dst)}))))
 
 (defn copy-point!
-  "Copies the visible block for one numeric coordinate; returns true when present."
+  "Copies the visible block for one numeric coordinate; returns `dst`, or nil when absent."
   [^CSR64LedgerOverlay overlay row-id col-id ^doubles dst dst-off]
   (let [source
         (.-base overlay)
@@ -664,11 +664,10 @@
                                                  col-id)]
           (when (= :put op)
             (System/arraycopy ^doubles block 0 dst (int dst-off) (int (p/csr-block-dim source)))
-            true)
+            dst)
           (csr64/copy-point! source row-id col-id dst dst-off))
         (let [entry-id (csr64/find-entry source row-id col-id)]
-          (if (= -1 entry-id)
-            false
+          (when-not (= -1 entry-id)
             (let [idx (lower-bound-long value-entry-ids entry-id)]
               (if (and (< idx (alength value-entry-ids))
                        (= entry-id (aget value-entry-ids (int idx))))
@@ -677,5 +676,5 @@
                                       dst
                                       (int dst-off)
                                       (int (p/csr-block-dim source)))
-                    true)
+                    dst)
                 (csr64/copy-point! source row-id col-id dst dst-off)))))))))

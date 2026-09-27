@@ -1,7 +1,7 @@
 (ns sparse-layout.csr64
   "Java 25 MemorySegment-backed CSR storage with 64-bit entry offsets."
   (:require [sparse-layout.csr-source.protocols :as p])
-  (:import [java.io Closeable EOFException]
+  (:import [java.io Closeable EOFException Writer]
            [java.lang.foreign Arena MemorySegment ValueLayout ValueLayout$OfDouble ValueLayout$OfInt
             ValueLayout$OfLong]
            [java.nio ByteBuffer ByteOrder]
@@ -207,24 +207,20 @@
       (MemorySegment/ofArray (byte-array 0))
       (.map channel mode offset byte-size arena))))
 
-(defn- row-ptr ^long [^MemorySegment row-ptrs ^long row-id] (.getAtIndex row-ptrs le-long row-id))
+(defn- row-ptr
+  ^long [^MemorySegment row-ptrs ^long row-id]
+  (.getAtIndex row-ptrs ValueLayout/JAVA_LONG_UNALIGNED row-id))
 
 (defn- entry-col
   ^long [^MemorySegment col-ids ^long entry-id]
-  (.getAtIndex col-ids le-int entry-id))
+  (.getAtIndex col-ids ValueLayout/JAVA_INT_UNALIGNED entry-id))
 
 (defn- ensure-index!
-  ^long [label value upper-bound]
-  (let [value
-        (long value)
-
-        upper-bound
-        (long upper-bound)]
-
-    (when (or (neg? value) (>= value upper-bound))
-      (throw (ex-info "CSR64 index is out of bounds."
-                      {:index label :value value :upper-bound upper-bound})))
-    value))
+  ^long [label ^long value ^long upper-bound]
+  (when (or (neg? value) (>= value upper-bound))
+    (throw (ex-info "CSR64 index is out of bounds."
+                    {:index label :value value :upper-bound upper-bound})))
+  value)
 
 (defn- ensure-row-range!
   [row-start row-end row-count]
@@ -383,8 +379,8 @@
                                (int (+ dst-entry-off (- fill-start entry-start)))
                                (int (+ dst-entry-off (- fill-end entry-start)))
                                (int row-id)))
-                (recur (inc row-id)))))
-          entry-count)))))
+                (recur (inc row-id))))))
+        entry-count))))
 
 (defn- copy-block-fields!
   [^MemorySegment payload entry-count block-dim entry-id ^doubles dst dst-off]
@@ -503,10 +499,62 @@
   Closeable
     (close [_] (when (.isAlive (.scope rowPtrs)) (.close arena))))
 
+(definterface PageFill (^void setCount [^long n]))
+
+(deftype Page [^ints rowIds ^ints colIds ^doubles values ^long capacity ^long blockDim
+               ^:unsynchronized-mutable ^long filled]
+  clojure.lang.Counted
+    (count [_] (int filled))
+  PageFill
+    (setCount [_ n] (set! filled n)))
+
+(defn- print-shape
+  [value shape ^Writer writer]
+  (.write writer (str "#object[" (.getName (class value)) " "))
+  (print-method shape writer)
+  (.write writer "]"))
+
+(defmethod print-method CSR64Source
+  [^CSR64Source source writer]
+  (print-shape source
+               {:path (str (.-path source))
+                :row-count (.-rowCount source)
+                :col-count (.-colCount source)
+                :entry-count (.-entryCount source)
+                :block-dim (.-blockDim source)
+                :open? (.isAlive (.scope ^MemorySegment (.-rowPtrs source)))}
+               writer))
+
+(defmethod print-method Page
+  [^Page page writer]
+  (print-shape page
+               {:count (count page) :capacity (.-capacity page) :block-dim (.-blockDim page)}
+               writer))
+
 (defn metadata
   "Returns immutable CSR64 artifact metadata without exposing mapped storage."
   [^CSR64Source source]
   (assoc (.-plan source) :path (.-path source)))
+
+(defn row-count
+  "Returns the number of rows in the source."
+  ^long [^CSR64Source source]
+  (.-rowCount source))
+
+(defn col-count
+  "Returns the number of columns in the source."
+  ^long [^CSR64Source source]
+  (.-colCount source))
+
+(defn entry-count
+  "Returns the number of stored entries in the source."
+  ^long [^CSR64Source source]
+  (.-entryCount source))
+
+(defn block-dim
+  "Returns the number of doubles in each entry's payload block."
+  ^long [^CSR64Source source]
+  (.-blockDim source))
 
 (defn range-entry-count
   "Returns the number of entries in the half-open numeric row range."
@@ -518,7 +566,8 @@
   "Copies at most `max-entries` from a contiguous row range.
 
   `cursor` is the number of entries already consumed from the selected range.
-  Returns the copied entry count; the next cursor is `cursor + copied`."
+  Returns the copied entry count; the next cursor is `cursor + copied`. An empty
+  range or an exhausted cursor returns 0 without writing."
   [^CSR64Source source row-start row-end cursor max-entries ^ints dst-row-ids ^ints dst-col-ids
    ^doubles dst-values dst-entry-off]
   (copy-page-fields! (.-rowPtrs source)
@@ -535,9 +584,241 @@
                      dst-values
                      dst-entry-off))
 
+(defn page
+  "Returns a reusable page buffer for `source`.
+
+  It holds `int[capacity]` row ids, `int[capacity]` column ids and
+  `double[capacity × block-dim]` values, which `pages` refills on every step. Throws
+  `ex-info` unless `capacity` is positive and `capacity × block-dim` fits in
+  `Integer/MAX_VALUE`."
+  [^CSR64Source source capacity]
+  (let [capacity
+        (long capacity)
+
+        dim
+        (.-blockDim source)]
+
+    (when (or (< capacity 1) (> capacity (quot Integer/MAX_VALUE (max 1 dim))))
+      (throw (ex-info "CSR64 page capacity is out of bounds."
+                      {:capacity capacity :block-dim dim :max-value-count Integer/MAX_VALUE})))
+    (Page. (int-array capacity)
+           (int-array capacity)
+           (double-array (* capacity dim))
+           capacity
+           dim
+           0)))
+
+(defn pages
+  "Returns a reducible over the entries of a half-open row range, all rows by default.
+
+  Every step receives `buf`, a buffer from `page`, refilled with the next entries,
+  so a page is valid only inside the step that receives it. Implements `IReduceInit`
+  only: `seq` throws instead of keeping the borrowed buffer alive. Returning `reduced`
+  stops the drain before the next copy. Throws `ex-info` for an invalid row range, or
+  for a buffer whose block dim differs from the source's."
+  ([^CSR64Source source buf] (pages source 0 (.-rowCount source) buf))
+  ([^CSR64Source source row-start row-end buf]
+   (ensure-row-range! row-start row-end (.-rowCount source))
+   (when-not (and (instance? Page buf) (= (.-blockDim ^Page buf) (.-blockDim source)))
+     (throw (ex-info "CSR64 page buffer does not match the source's block dim."
+                     {:block-dim (.-blockDim source)
+                      :buffer-block-dim (when (instance? Page buf) (.-blockDim ^Page buf))})))
+   ;; copy-page-fields! takes Object arguments: box the drain's invariants once here
+   ;; instead of once per page.
+   (let [row-start
+         (num (long row-start))
+
+         row-end
+         (num (long row-end))
+
+         rows
+         (num (.-rowCount source))
+
+         dim
+         (num (.-blockDim source))
+
+         capacity
+         (num (.-capacity ^Page buf))
+
+         ^Page buf
+         buf]
+
+     (reify
+       clojure.lang.IReduceInit
+         (reduce [_ f init]
+           (let [total (range-entry-count source row-start row-end)]
+             (loop [cursor 0
+                    acc init]
+
+               (if (< cursor total)
+                 (let [copied (long (copy-page-fields! (.-rowPtrs source)
+                                                       (.-colIds source)
+                                                       (.-payload source)
+                                                       rows
+                                                       dim
+                                                       row-start
+                                                       row-end
+                                                       cursor
+                                                       capacity
+                                                       (.-rowIds buf)
+                                                       (.-colIds buf)
+                                                       (.-values buf)
+                                                       0))]
+                   (.setCount buf copied)
+                   (let [acc (f acc buf)]
+                     (if (reduced? acc) @acc (recur (+ cursor copied) acc))))
+                 acc))))))))
+
+(defn page-row
+  "Returns the row id of entry `i` in the current step's page."
+  ^long [^Page page ^long i]
+  (aget ^ints (.-rowIds page) (ensure-index! :page-entry i (count page))))
+
+(defn page-col
+  "Returns the column id of entry `i` in the current step's page."
+  ^long [^Page page ^long i]
+  (aget ^ints (.-colIds page) (ensure-index! :page-entry i (count page))))
+
+(defn page-lane
+  "Returns lane `k` of entry `i`'s block in the current step's page."
+  ^double [^Page page ^long i ^long k]
+  (let [dim (.-blockDim page)]
+    (aget ^doubles (.-values page)
+          (+ (* (ensure-index! :page-entry i (count page)) dim) (ensure-index! :lane k dim)))))
+
+(defn page-rows
+  "Returns the page's row-id array; only the first `(count page)` ids are valid."
+  ^ints [^Page page]
+  (.-rowIds page))
+
+(defn page-cols
+  "Returns the page's column-id array; only the first `(count page)` ids are valid."
+  ^ints [^Page page]
+  (.-colIds page))
+
+(defn page-values
+  "Returns the page's value array; only the first `(count page)` blocks are valid."
+  ^doubles [^Page page]
+  (.-values page))
+
+(defn lane
+  "Returns lane `k` of entry `entry-id`'s block, read from the mapping."
+  ^double [^CSR64Source source ^long entry-id ^long k]
+  (let [dim (.-blockDim source)]
+    (.getAtIndex ^MemorySegment (.-payload source)
+                 ValueLayout/JAVA_DOUBLE_UNALIGNED
+                 (+ (* (ensure-index! :entry-id entry-id (.-entryCount source)) dim)
+                    (ensure-index! :lane k dim)))))
+
+(defn- ensure-reduce-entries-form!
+  [entry-bindings range-bindings acc-bindings]
+  (when-not (and (vector? entry-bindings)
+                 (= 3 (count entry-bindings))
+                 (every? simple-symbol? entry-bindings)
+                 (vector? range-bindings)
+                 (contains? #{1 3} (count range-bindings))
+                 (vector? acc-bindings)
+                 (= 2 (count acc-bindings))
+                 (simple-symbol? (first acc-bindings)))
+    (throw (ex-info
+             "reduce-entries expects [row col e], [src] or [src row-start row-end], and [acc init]."
+             {:entry-bindings entry-bindings
+              :range-bindings range-bindings
+              :acc-bindings acc-bindings}))))
+
+(defmacro reduce-entries
+  "Reduces over the entries of a half-open numeric row range, reading the mapping directly.
+
+  `(reduce-entries [row col e] [src row-start row-end] [acc init] body)` binds `row`, `col` and
+  the entry id `e` as primitive longs, in `csr-scan-ranges!` order, and binds `acc` to `init`
+  and then to each body value; it returns the last one. `[src]` alone covers every row. Rows
+  without entries are skipped.
+
+  `src`, the bounds and `init` are evaluated once, in that order. An invalid row range throws
+  `ex-info` before `init` is evaluated. The expansion is one flat loop: a primitive `init` and
+  body keep `acc` unboxed, and any other body still works, but boxes. The body sits in
+  expression position, where an inner `loop` or `dotimes` compiles into a closure; put
+  multi-lane work in a primitive-typed helper and call it from the body. `reduced` does not
+  stop the loop. The source must stay open until the call returns."
+  [entry-bindings range-bindings acc-bindings & body]
+  (ensure-reduce-entries-form! entry-bindings range-bindings acc-bindings)
+  (let [[row col e]
+        entry-bindings
+
+        [source row-start row-end]
+        range-bindings
+
+        [acc init]
+        acc-bindings
+
+        bounded?
+        (= 3 (count range-bindings))
+
+        src
+        (vary-meta (gensym "src") assoc :tag `CSR64Source)]
+
+    `(let [~src
+           ~source
+
+           start-row#
+           ~(if bounded? `(long ~row-start) 0)
+
+           end-row#
+           ~(if bounded? `(long ~row-end) `(row-count ~src))
+
+           entry-count#
+           (range-entry-count ~src start-row# end-row#)
+
+           ^MemorySegment row-ptrs#
+           (.-rowPtrs ~src)
+
+           ^MemorySegment col-ids#
+           (.-colIds ~src)
+
+           start-entry#
+           (.getAtIndex row-ptrs# ValueLayout/JAVA_LONG_UNALIGNED start-row#)
+
+           end-entry#
+           (+ start-entry# entry-count#)]
+
+       (loop [entry#
+              start-entry#
+
+              row#
+              (unchecked-dec start-row#)
+
+              row-end-entry#
+              start-entry#
+
+              acc#
+              ~init]
+
+         (if (< entry# end-entry#)
+           (if (< entry# row-end-entry#)
+             (let [~row
+                   row#
+
+                   ~col
+                   (long (.getAtIndex col-ids# ValueLayout/JAVA_INT_UNALIGNED entry#))
+
+                   ~e
+                   entry#
+
+                   ~acc
+                   acc#]
+
+               (recur (unchecked-inc entry#) row# row-end-entry# (do ~@body)))
+             (let [next-row# (unchecked-inc row#)]
+               (recur
+                 entry#
+                 next-row#
+                 (.getAtIndex row-ptrs# ValueLayout/JAVA_LONG_UNALIGNED (unchecked-inc next-row#))
+                 acc#)))
+           acc#)))))
+
 (defn find-entry
   "Returns the entry id for a numeric row/column coordinate, or -1."
-  ^long [^CSR64Source source row-id col-id]
+  ^long [^CSR64Source source ^long row-id ^long col-id]
   (let [row-id
         (ensure-index! :row-id row-id (.-rowCount source))
 
@@ -569,7 +850,7 @@
         -1))))
 
 (defn copy-point!
-  "Copies one numeric coordinate into `dst`; returns true when present."
+  "Copies one numeric coordinate into `dst`; returns `dst`, or nil when absent."
   [^CSR64Source source row-id col-id ^doubles dst dst-off]
   (let [entry-id (find-entry source row-id col-id)]
     (when-not (= -1 entry-id)
@@ -578,8 +859,7 @@
                           (.-blockDim source)
                           entry-id
                           dst
-                          dst-off)
-      true)))
+                          dst-off))))
 
 (defn load!
   "Best-effort preload of every mapped CSR64 section."
@@ -626,9 +906,19 @@
         (recur (inc entry-id)))))
   nil)
 
+(defn- ensure-little-endian-host!
+  [^ByteOrder native-order]
+  (when-not (= ByteOrder/LITTLE_ENDIAN native-order)
+    (throw (ex-info "CSR64 reads require a little-endian host."
+                    {:native-order (str native-order)})))
+  nil)
+
 (defn open-artifact
-  "Opens a v2 CSR64 artifact through shared, read-only MemorySegments."
+  "Opens a v2 CSR64 artifact through shared, read-only MemorySegments.
+
+  Reads use the host's native byte order, so big-endian hosts are rejected."
   ^CSR64Source [path]
+  (ensure-little-endian-host! (ByteOrder/nativeOrder))
   (let [path
         (path-of path)
 

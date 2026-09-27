@@ -2,8 +2,9 @@
   "Compares heap CSR, mapped CSR64, Flatiron CSR, and three Parquet encodings.
 
   Every timed path copies the same selected edges into caller-owned primitive
-  arrays allocated before timing. Parquet generation and CSR construction are
-  reported separately."
+  arrays allocated before timing. Mapped CSR64 is read through `copy-page!`, a
+  `pages` drain, and `reduce-entries` with `lane`. Parquet generation and CSR
+  construction are reported separately."
   (:gen-class)
   (:require [clojure.string :as str]
             [sparse-layout.bench-data :as data]
@@ -21,6 +22,7 @@
 
 (def block-dim 295)
 (def latency-ceiling-ms 50.0)
+(def csr64-page-capacity 4096)
 
 (sparse/defsparse comparison-features
                   {:row-key [:entity]
@@ -261,6 +263,65 @@
 
     #(csr64/copy-page! source start-row end-row 0 edge-count rows cols values 0)))
 
+(defn- csr64-pages-runner
+  [source ^long start-row ^long end-row destination]
+  (let [rows
+        ^ints (:rows destination)
+
+        cols
+        ^ints (:cols destination)
+
+        values
+        ^doubles (:values destination)
+
+        dim
+        (csr64/block-dim source)
+
+        buf
+        (csr64/page source csr64-page-capacity)
+
+        append-page
+        (fn [^long offset page]
+          (let [copied (count page)]
+            (System/arraycopy (csr64/page-rows page) 0 rows offset copied)
+            (System/arraycopy (csr64/page-cols page) 0 cols offset copied)
+            (System/arraycopy (csr64/page-values page) 0 values (* offset dim) (* copied dim))
+            (+ offset copied)))]
+
+    #(reduce append-page 0 (csr64/pages source start-row end-row buf))))
+
+(defn- copy-lanes!
+  "Copies entry `entry-id`'s block into block slot `slot` of `values`, one `csr64/lane` read
+  per double; returns the next slot."
+  ^long [source ^long entry-id ^doubles values ^long slot]
+  (let [dim
+        (csr64/block-dim source)
+
+        offset
+        (* slot dim)]
+
+    (dotimes [k dim]
+      (aset values (+ offset k) (csr64/lane source entry-id k)))
+    (inc slot)))
+
+(defn- csr64-reduce-entries-runner
+  [source ^long start-row ^long end-row destination]
+  (let [rows
+        ^ints (:rows destination)
+
+        cols
+        ^ints (:cols destination)
+
+        values
+        ^doubles (:values destination)]
+
+    #(csr64/reduce-entries [row col e]
+                           [source start-row end-row]
+                           [slot 0]
+                           (aset rows slot (int row))
+                           (aset cols slot (int col))
+                           (copy-lanes! source e values slot))))
+
 (defn- parquet-query
   [^Path path projection]
   (str "SELECT " projection
@@ -483,7 +544,7 @@
 (defn- reps-for
   [backend edge-count smoke?]
   (cond smoke? 1
-        (= :csr64 backend) 100
+        (#{:csr64 :csr64-pages :csr64-reduce-entries} backend) 100
         :else (max 5 (min 30 (quot 3000000 (max 1 (* edge-count block-dim)))))))
 
 (defn- format-bytes
@@ -562,9 +623,14 @@
         wide-projection
         (str "row_id, col_id, " (str/join ", " (map #(str "p" %) (range block-dim))))
 
+        baseline
+        (sparse-bulk-runner source start end expected)
+
         runners
         [[:csr64 (csr64-runner mapped-source start end actual) actual]
-         [:sparse-bulk (sparse-bulk-runner source start end expected) expected]
+         [:csr64-pages (csr64-pages-runner mapped-source start end actual) actual]
+         [:csr64-reduce-entries (csr64-reduce-entries-runner mapped-source start end actual) actual]
+         [:sparse-bulk baseline expected]
          [:sparse-visitor (sparse-visitor-runner source start end actual) actual]
          [:flatiron-csr-sidecar (flatiron/runner flatiron-source start end actual) actual]
          [:parquet-295-columns
@@ -575,10 +641,10 @@
           (projected-runner connection (:array-list paths) projection start end actual) actual]]
 
         baseline-count
-        ((second (second runners)))]
+        (baseline)]
 
     (assert (= edge-count baseline-count))
-    (doseq [[backend runner output] (concat [(first runners)] (drop 2 runners))]
+    (doseq [[backend runner output] (remove #(= :sparse-bulk (first %)) runners)]
       (assert (= edge-count (long (runner))) (str backend " returned the wrong edge count"))
       (assert (same-output? expected output) (str backend " output differs from sparse CSR")))
     (mapv (fn [[backend runner _]]
