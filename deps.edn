@@ -37,7 +37,7 @@
                    :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
                    :main-opts ["-m" "sparse-layout.duckdb-compare"]}
   :compare-test {:extra-paths ["test"]
-                 :main-opts ["-e" "(require 'sparse-layout.flatiron-compare-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.flatiron-compare-test)] (when (pos? (+ fail error)) (System/exit 1)))"]}
+                 :main-opts ["-e" "(require 'sparse-layout.flatiron-compare-test 'sparse-layout.duckdb-compare-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.flatiron-compare-test 'sparse-layout.duckdb-compare-test)] (when (pos? (+ fail error)) (System/exit 1)))"]}
   :overlay-compare {:extra-paths ["bench"]
                     :extra-deps {net.mikera/vectorz-clj {:mvn/version "0.48.0"}}
                     :main-opts ["-m" "sparse-layout.overlay-compare"]}

@@ -950,13 +950,27 @@
   (when-not (= entry-count (row-ptr row-ptrs row-count))
     (throw (ex-info "CSR64 final row pointer must equal entry count."
                     {:final-row-pointer (row-ptr row-ptrs row-count) :entry-count entry-count})))
-  (loop [entry-id (long 0)]
-    (when (< entry-id entry-count)
-      (let [col-id (entry-col col-ids entry-id)]
-        (when (or (neg? col-id) (>= col-id col-count))
-          (throw (ex-info "CSR64 column id is out of bounds."
-                          {:entry-id entry-id :col-id col-id :col-count col-count})))
-        (recur (inc entry-id)))))
+  (loop [row-id (long 0)]
+    (when (< row-id row-count)
+      (let [start (row-ptr row-ptrs row-id)
+            end (row-ptr row-ptrs (inc row-id))]
+
+        (loop [entry-id start
+               previous-col-id (long -1)]
+
+          (when (< entry-id end)
+            (let [col-id (entry-col col-ids entry-id)]
+              (when (or (neg? col-id) (>= col-id col-count))
+                (throw (ex-info "CSR64 column id is out of bounds."
+                                {:entry-id entry-id :col-id col-id :col-count col-count})))
+              (when (<= col-id previous-col-id)
+                (throw (ex-info "CSR64 column ids must be strictly increasing within each row."
+                                {:row-id row-id
+                                 :entry-id entry-id
+                                 :previous-col-id previous-col-id
+                                 :col-id col-id})))
+              (recur (inc entry-id) col-id))))
+        (recur (inc row-id)))))
   nil)
 
 (defn- ensure-little-endian-host!

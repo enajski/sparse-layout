@@ -635,6 +635,9 @@
 
     (assert (= edge-count baseline-count))
     (doseq [[backend runner output] (remove #(= :sparse-bulk (first %)) runners)]
+      (Arrays/fill ^ints (:rows output) -1)
+      (Arrays/fill ^ints (:cols output) -1)
+      (Arrays/fill ^doubles (:values output) Double/NaN)
       (assert (= edge-count (long (runner))) (str backend " returned the wrong edge count"))
       (assert (same-output? expected output) (str backend " output differs from sparse CSR")))
     (mapv (fn [[backend runner _]]

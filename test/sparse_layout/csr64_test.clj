@@ -4,7 +4,7 @@
             [sparse-layout.csr-source :as csr]
             [sparse-layout.csr64 :as csr64]
             [sparse-layout.csr64-overlay :as overlay])
-  (:import [java.nio ByteOrder]
+  (:import [java.nio ByteBuffer ByteOrder]
            [java.nio.file Files Path]
            [java.util Arrays]))
 
@@ -161,6 +161,28 @@
                      (is (= 5 (csr64/range-entry-count mapped 0 4)))
                      (is (= 0 (csr/csr-row-id mapped 0)))
                      (is (= -1 (csr/csr-row-id mapped :unknown)))))))
+
+(deftest rejects-unsorted-and-duplicate-columns-when-opening
+  (doseq [[kind replacements] [[:unsorted [[0 1] [1 0]]] [:duplicate [[1 0]]]]]
+    (testing (name kind)
+      (let [path (temp-artifact)]
+        (try (csr64/write-artifact! (test-source) path)
+             (let [buffer (doto (ByteBuffer/wrap (Files/readAllBytes path))
+                            (.order ByteOrder/LITTLE_ENDIAN))
+                   columns-offset (.getLong buffer 56)]
+
+               (doseq [[entry-id col-id] replacements]
+                 (.putInt buffer (int (+ columns-offset (* entry-id 4))) (int col-id)))
+               (Files/write path (.array buffer) (make-array java.nio.file.OpenOption 0))
+               (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                     #"strictly increasing"
+                                     (with-open [mapped (csr64/open-artifact path)]
+                                       mapped))))
+             (finally (Files/deleteIfExists path))))))
+  (with-artifact (gapped-source)
+                 (fn [_ mapped]
+                   (is (= [1 1] (csr/csr-row-span mapped 1)))
+                   (is (= [1 3] (csr/csr-row-span mapped 2))))))
 
 (deftest copies-bounded-pages-with-a-continuation-cursor
   (with-artifact (test-source)
@@ -712,6 +734,17 @@
                      (is (= [2 3] (vec rows)))
                      (is (= [0 1] (vec cols)))
                      (is (= [10.0 11.0 12.0 13.0 14.0 15.0] (vec values)))))))
+
+(deftest ledger-rejects-falsey-records-between-valid-entries
+  (with-artifact (test-source)
+                 (fn [_ mapped]
+                   (doseq [record [nil false]]
+                     (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                           #"sequence must be an integer"
+                                           (overlay/compile-ledger
+                                             mapped
+                                             [{:sequence 0 :op :delete :row-id 0 :col-id 0} record
+                                              {:sequence 1 :op :delete :row-id 0 :col-id 1}])))))))
 
 (deftest ledger-overlay-validates-before-writing
   (let [heap (test-source)]

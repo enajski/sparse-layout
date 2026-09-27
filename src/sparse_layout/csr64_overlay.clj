@@ -83,8 +83,13 @@
            record-count
            (long 0)]
 
-      (if-let [record (first remaining)]
-        (let [sequence-id (:sequence record)]
+      (if remaining
+        (let [record
+              (first remaining)
+
+              sequence-id
+              (:sequence record)]
+
           (when-not (integer? sequence-id)
             (fail! "CSR64 ledger sequence must be an integer." {:record record}))
           (let [sequence-id (long sequence-id)]
