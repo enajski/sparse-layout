@@ -11,10 +11,10 @@ allocate.
 
 > **Short answer after measuring:** do not replace the hot CSR traversal with a
 > DuckDB 1.5.5 Parquet query for this 295-double workload. Keep Parquet/DuckDB as
-> the canonical-data side and generate a narrow CSR serving value when a snapshot
-> will receive enough visits. The arena path now allocates roughly 248–320 JVM
-> bytes per *call*, rather than roughly 200–209 bytes per edge through the generic
-> callback.
+> the canonical-data side and generate a narrow CSR64 serving value when a snapshot
+> will receive enough visits. The mapped page path allocates roughly 192–256 JVM
+> bytes per *call*. It meets the 50 ms p99 ceiling through a 590 MiB drain, but a
+> single 1.73 GiB drain does not and must remain paged.
 
 The useful choice is not “clever CSR versus clever database.” It is:
 
@@ -36,14 +36,14 @@ the amortized repeated-drain path.
 
 Use **DuckDB 1.5.5 upstream and a small CSR derivative downstream**. The matched
 benchmark now copies exact-equal output from three Parquet encodings and
-`CSRSource` into the same preallocated arrays. Bulk CSR was 26–49× faster for
-full snapshot materialization and 489–3,917× faster for one-row selection across
-the existing small/medium/large shapes. Preserve the adjacency kernel; do not use
-those numbers to preserve every macro, facade, overlay, and persistence feature
-around it.
+heap/mapped CSR sources into the same preallocated arrays. Mapped CSR64 was
+36–42× faster for full snapshot materialization and 326–4,597× faster for
+one-row selection across the existing small/medium/large shapes. Preserve the
+adjacency kernel; do not use those numbers to preserve every macro, facade,
+overlay, and persistence feature around it.
 
 ```text
-                         ┌─ CSRSource bulk copy ───────────────┐
+                         ┌─ mapped CSR64 page copy ────────────┐
 input / snapshot ───────┤                                     ├─→ same preallocated arrays
                          └─ DuckDB → prepared chunked query ───┘
 ```
@@ -82,11 +82,11 @@ The decisive question is therefore:
 > **How many entries does one visit select, and how many times is the frozen
 > snapshot visited before it is replaced?**
 
-The measured time-only crossover is already small for bulk work: roughly 3–5
-full drains repay Parquet→CSR construction. For isolated rows it is about
-154–270 visits per snapshot, and for 64-row ranges about 44–180. Use the actual
-production selection mix and snapshot lifetime to decide whether to materialize
-the derivative at all.
+The measured time-only crossover is already small for bulk work: roughly 3–6
+full drains repay the measured Parquet→COO→heap→loaded-CSR64 route. For isolated
+rows it is about 185–325 visits per snapshot, and for 64-row ranges about
+54–210. Use the actual production selection mix and snapshot lifetime to decide
+whether to materialize the derivative at all.
 
 ---
 
@@ -98,7 +98,7 @@ Separate the desired outcome from the mechanism already built.
 | Phrase | A testable meaning | What exists today |
 |---|---|---|
 | **Efficient ingestion** | Selected sparse blocks are materialized into the downstream system's arrays | `csr-copy-ranges!` fills row IDs, column IDs, and dense blocks in CSR order |
-| **Low allocation** | After destination allocation, a scan creates no payload arrays and stays within a measured budget | bulk copy allocates about 248–320 B/call; generic visiting remains about 200–209 B/edge |
+| **Low allocation** | After destination allocation, a scan creates no payload arrays and stays within a measured budget | mapped CSR64 allocates about 192–256 B/call; generic visiting remains per-edge |
 | **Preallocated arena** | The downstream system sizes and owns result arrays; source storage may allocate independently | This is supported for fixed double blocks; notebook helpers currently allocate arrays but callers need not |
 | **Sparse / dense mixed** | A defined physical choice for sparse and dense regions, with a density crossover | Sparse outer coordinates with one uniform payload kind; “dense” means a dense vector inside each present cell |
 | **Zero-copy** | Not the goal here: a deliberate copy into owned destination storage is acceptable | Payload bytes are copied; allocation of a fresh destination per entry is avoided |
@@ -259,6 +259,7 @@ The allocation story depends entirely on the API:
 | heap `csr-copy-block!` | yes, into caller array | reusable output; callback boxing remains possible |
 | mmap `csr-copy-block!` | yes, double by double | reusable output |
 | `csr-copy-ranges!` | yes, directly into caller arrays | measured 248–320 B per call |
+| CSR64 `copy-page!` | yes, bounded bulk `MemorySegment` copy | measured 192–256 B per call |
 
 The useful claim is not “zero allocation.” It is:
 
@@ -567,10 +568,10 @@ Choose this when:
 What disappears: custom sorting/coalescing, overlay rules, query facades, prefix
 indexes, binary format, corruption validation, and much of the generated API.
 
-### B. CSR bulk transfer — when repeated traversal is the product
+### B. CSR64 bulk transfer — when repeated traversal is the product
 
 ```text
-allocated build/freeze → CSRSource bulk copy → downstream preallocated arrays
+numeric CSR64 artifact → bounded MemorySegment page copy → downstream arrays
 ```
 
 Choose this when measurements require:
@@ -579,10 +580,11 @@ Choose this when measurements require:
 - predictable row-span traversal and buffer reuse; or
 - a raw mmap layout consumed without a database engine.
 
-This is the narrow `CSRSource` design. `csr-copy-ranges!` fits the clarified
-requirement; the generic per-entry visitor stays available for transforms. The
-minimal retained product is row pointers, column IDs, fixed-width payloads, and
-only the dictionaries required for selection.
+This is the narrow CSR64 design. `copy-page!` fits the clarified requirement;
+the generic per-entry visitor stays available for transforms. The minimal
+retained product is 64-bit row pointers, numeric column IDs, fixed-width
+payloads, and a bounded page contract. Logical key resolution stays outside the
+artifact.
 
 ### C. DuckDB plus a CSR serving index — only if A and B each win something
 
@@ -616,21 +618,21 @@ Arrow or a table function—is similarly optional, not a default roadmap.
 
 ## Decision table
 
-| Requirement | DuckDB chunk adapter | Current `CSRSource` | DuckDB + CSR index |
+| Requirement | DuckDB chunk adapter | Mapped CSR64 | DuckDB + CSR index |
 |---|:---:|:---:|:---:|
 | fill caller-preallocated arrays | yes, explicit copy from vectors | yes, explicit range copy | yes |
-| no fresh payload array per entry | expected; must measure Java path | yes in `csr-copy-ranges!` | yes |
+| no fresh payload array per entry | expected; must measure Java path | yes in `copy-page!` | yes |
 | no per-entry boxing/wrapper allocation | chunk-oriented; measure getters | yes on bulk path; no on generic visitor | yes on bulk path |
 | deterministic adjacency span | not as public contract | yes | yes |
 | thousands of tiny point reads | workload mismatch; measure | designed for it | designed for it |
-| bulk dynamic selection | strong | range/prefix-specific | both paths available |
+| bulk dynamic selection | strong | contiguous numeric row ranges | both paths available |
 | ad hoc filters/joins/aggregates | excellent | bespoke/limited | excellent upstream |
 | transactions and concurrent writers | built in, within documented process model | no | built in upstream |
 | out-of-core operators | yes | no | yes upstream |
-| durable format/schema evolution | built in | custom v1 format | built in upstream |
+| durable format/schema evolution | built in | custom numeric v2 format | built in upstream |
 | heterogeneous nested data | rich types | one payload kind per layout | rich upstream, fixed serving index |
 | native sparse matrix storage | no | CSR/CSC | CSR |
-| implementation you maintain | schema + drain loop | ~4,257 source lines plus format | adapter + derived-index lifecycle |
+| implementation you maintain | schema + drain loop | narrow v2 reader/writer plus inherited source protocol | adapter + derived-index lifecycle |
 
 DuckDB supports multiple writer threads/connections within one process, while
 multi-process writes are not the primary model
@@ -644,15 +646,17 @@ model unless the separate 2.0-era server work is deliberately adopted.
 
 ### Yes, in scope
 
-The runtime has grown to roughly 4,257 source lines and includes five payload
+The runtime has grown to roughly 5,749 source lines and includes five payload
 kinds, four duplicate policies, CSR and CSC, code generation, two facade modes,
-heap and mmap sources, a custom file format, prefix indexes, and a DOK overlay.
+heap and mmap sources, a custom file format, prefix indexes, a DOK overlay, and
+the compiled CSR64 ledger overlay.
 
 The motivating fixed-block copy contract now has a direct materialization
 benchmark, an allocation profile, a visits-per-snapshot amortization model, and
-a DuckDB chunked-result comparison. Production p99/allocation gates, real-data
-skew, and the density crossover remain unspecified. The measurements justify a
-narrow serving kernel, not every mechanism surrounding it.
+a DuckDB chunked-result comparison. The local p99 gate is now 50 ms; production
+data skew, cold-cache behavior, concurrency, and the density crossover remain
+unspecified. The measurements justify a narrow serving kernel, not every
+mechanism surrounding it.
 
 Particularly suspect surfaces are retained COO by default, generated marker
 protocols with no internal consumer, a 437-line collection facade around an
@@ -682,12 +686,15 @@ order. Record construction separately so reuse can amortize it honestly.
 
 ### Contenders
 
-1. **Bulk CSR:** build/freeze once; repeat `csr-copy-ranges!` into caller arrays.
-2. **DuckDB stable:** append once; repeat a prepared, ordered
+1. **Mapped CSR64:** build/write/preload once; repeat bounded `copy-page!` calls
+   into caller arrays.
+2. **Heap CSR control:** build/freeze once; repeat `csr-copy-ranges!` into caller
+   arrays.
+3. **DuckDB stable:** append once; repeat a prepared, ordered
    `DuckDBChunkedResult` and drain scalar vectors into the same arrays.
-3. **Generic visitor control:** repeat `csr-scan-*` plus `csr-copy-block!` to
+4. **Generic visitor control:** repeat `csr-scan-*` plus `csr-copy-block!` to
    isolate the old callback cost.
-4. **Hybrid, later:** DuckDB builds a derived CSR index, only if each of the first
+5. **Hybrid, later:** DuckDB builds a derived CSR index, only if each of the first
    two wins a different production requirement.
 
 The bulk/visitor split prevents a loss at the generic Clojure callback from being
@@ -785,7 +792,8 @@ The new executable benchmark is
 [`duckdb_compare.clj`](../bench/sparse_layout/duckdb_compare.clj). It pins the
 DuckDB JDBC artifact `1.5.5.0` (engine `v1.5.5`) and changes the payload from the
 old four-double smoke shape to the production width: **295 doubles for every
-present `(row-key, col-key)` pair**.
+present `(row-key, col-key)` pair**. It now includes the Java 25 mapped CSR64
+path and fails when that contender exceeds the 50 ms p99 ceiling.
 
 It retains the existing compound-map key and sparsity scales:
 
@@ -812,43 +820,49 @@ nested column cannot be drained directly through that API
 ([DuckDB Java result handling](https://duckdb.org/docs/current/clients/java/result_handling)).
 
 Setup streams the compact list file through DuckDB, reconstructs the existing
-compound keys, appends to the mutable COO builder, and freezes a CSR-only source.
-Every timed contender then writes row IDs, column IDs, and 295-double blocks into
-the same two preallocated `int[]` arrays and one preallocated `double[]`. Exact
-array equality is checked before timing. DuckDB is single-threaded; query
-warmups make these cache-warm results.
+compound keys, appends to the mutable COO builder, freezes a CSR-only source,
+then writes, opens, validates, and preloads a numeric CSR64 artifact. Every timed
+contender writes row IDs, column IDs, and 295-double blocks into the same two
+preallocated `int[]` arrays and one preallocated `double[]`. Exact array equality
+is checked before timing. DuckDB is single-threaded; query warmups make these
+cache-warm results. CSR64 uses 100 measured samples per selection; the slower
+controls use 5–30.
 
 #### Setup and footprint
 
-| Scale | Parquet→COO→CSR | JVM allocation | 295-column file | 295-row file | list file |
+| Scale | Parquet→COO→heap CSR | CSR64 write | open + validate | preload | CSR64 file |
 |---|---:|---:|---:|---:|---:|
-| small | 300.2 ms | 193.46 MiB | 10.56 MiB | 9.80 MiB | 6.66 MiB |
-| medium | 2.189 s | 2.66 GiB | 158.36 MiB | 96.33 MiB | 62.30 MiB |
-| large | 5.954 s | 5.97 GiB | 287.91 MiB | 303.28 MiB | 221.42 MiB |
+| small | 291.5 ms | 57.6 ms | 8.9 ms | 1.9 ms | 55.42 MiB |
+| medium | 2.100 s | 425.3 ms | 31.7 ms | 21.1 ms | 591.13 MiB |
+| large | 5.854 s | 878.1 ms | 31.0 ms | 55.4 ms | 1.73 GiB |
+
+The Parquet files remained 10.56/158.36/287.91 MiB for 295 columns,
+9.80/96.33/303.28 MiB for 295 rows per edge, and 6.66/62.30/221.42 MiB for the
+compact list at small/medium/large respectively.
 
 Construction allocation is intentionally allowed, but it is not free: the
-large derivative allocates about 3.45× its 1.73 GiB logical payload while
-decoding, growing COO storage, and gathering the frozen payload. These are total
-thread allocations, not peak live heap. File generation is benchmark setup and
-is not included in the Parquet→CSR time.
+large Parquet→COO→heap step allocated 5.89 GiB while decoding, growing COO
+storage, and gathering the frozen payload. These are total thread allocations,
+not peak live heap. File generation is benchmark setup and is not included in
+the Parquet→CSR64 time.
 
 #### Serving result
 
-For each selection, this table compares the new bulk copy with the *fastest*
-direct Parquet shape. Times are medians; p95 and allocation remain available in
-the command output.
+For each selection, this table compares mapped CSR64 with the *fastest* direct
+Parquet shape. Times are medians; p95, p99, allocation, and the 50 ms result
+remain available in the command output.
 
-| Scale / selection | Edges | Bulk CSR | Best direct Parquet | Winning Parquet shape | DuckDB / CSR |
+| Scale / selection | Edges | CSR64 | Best direct Parquet | Winning Parquet shape | DuckDB / CSR64 |
 |---|---:|---:|---:|---|---:|
-| small / one row | 12 | 0.004 ms | 1.954 ms | 295 rows | 489× |
-| small / 64 rows | 768 | 0.088 ms | 6.985 ms | 295 rows | 79× |
-| small / full | 24,576 | 2.707 ms | 71.568 ms | 295 columns | 26× |
-| medium / one row | 16 | 0.005 ms | 8.103 ms | 295 rows | 1,621× |
-| medium / 64 rows | 1,024 | 0.114 ms | 14.896 ms | 295 rows | 131× |
-| medium / full | 262,144 | 26.964 ms | 746.080 ms | 295 columns | 28× |
-| large / one row | 24 | 0.006 ms | 23.502 ms | 295 rows | 3,917× |
-| large / 64 rows | 1,536 | 0.163 ms | 33.237 ms | 295 rows | 204× |
-| large / full | 786,432 | 54.256 ms | 2,677.841 ms | 295 columns | 49× |
+| small / one row | 12 | 0.006 ms | 1.953 ms | 295 rows | 326× |
+| small / 64 rows | 768 | 0.074 ms | 6.809 ms | 295 rows | 92× |
+| small / full | 24,576 | 2.052 ms | 73.990 ms | 295 columns | 36× |
+| medium / one row | 16 | 0.005 ms | 7.949 ms | 295 rows | 1,590× |
+| medium / 64 rows | 1,024 | 0.079 ms | 15.251 ms | 295 rows | 193× |
+| medium / full | 262,144 | 18.558 ms | 783.775 ms | 295 columns | 42× |
+| large / one row | 24 | 0.005 ms | 22.986 ms | 295 rows | 4,597× |
+| large / 64 rows | 1,536 | 0.103 ms | 32.652 ms | 295 rows | 317× |
+| large / full | 786,432 | 58.262 ms | 2,380.886 ms | 295 columns | 41× |
 
 The crossover did not appear. Row explosion wins DuckDB's selective case
 because it reads four primitive result columns, but it pays 295 physical result
@@ -856,47 +870,53 @@ rows per edge. Column explosion amortizes that row overhead on full scans. The
 compact list produces the smallest files yet is never the fastest Java path,
 because it must be cast and projected into 295 basic result vectors.
 
+The 50 ms result is more nuanced than the median ratio. DuckDB's row-explosion
+shape stayed below 50 ms for every one-row and 64-row selection. No DuckDB full
+drain passed. CSR64 passed every selective case and both small and medium full
+drains; its 1.73 GiB full drain reached 62.020 ms p99 and therefore must be split
+into bounded pages.
+
 The full-scan medians expose the important local trade-off as well:
 
-| Scale | Bulk CSR | Generic visitor | 295 columns | 295 rows | list→`DOUBLE[295]` |
-|---|---:|---:|---:|---:|---:|
-| small | 2.707 ms | 2.222 ms | 71.568 ms | 157.413 ms | 149.954 ms |
-| medium | 26.964 ms | 24.798 ms | 746.080 ms | 1,710.719 ms | 1,523.286 ms |
-| large | 54.256 ms | 69.831 ms | 2,677.841 ms | 5,145.269 ms | 4,750.417 ms |
+| Scale | CSR64 | Heap bulk | Generic visitor | 295 columns | 295 rows | list→`DOUBLE[295]` |
+|---|---:|---:|---:|---:|---:|---:|
+| small | 2.052 ms | 2.273 ms | 2.322 ms | 73.990 ms | 156.464 ms | 150.104 ms |
+| medium | 18.558 ms | 17.846 ms | 24.500 ms | 783.775 ms | 1,649.571 ms | 1,518.830 ms |
+| large | 58.262 ms | 60.499 ms | 74.895 ms | 2,380.886 ms | 5,090.563 ms | 4,463.442 ms |
 
-Bulk copy is 2–5× faster for one-row selections and about 2–3× faster for 64-row
-ranges than the generic visitor. One giant full-range copy is 9–22% slower on
-small and medium in these runs, then 22% faster at large. The old visitor remains
-useful when arbitrary per-edge work matters; the bulk path makes allocation a
-per-call cost when direct materialization matters.
+CSR64 and heap bulk copy are close enough that source residency and run noise
+matter more than their median gap. Both avoid the generic callback's per-entry
+allocation. The old visitor remains useful when arbitrary per-edge work matters;
+the mapped page path is the serving contract when bounded materialization matters.
 
 #### The allocation result now matches the arena contract
 
 Destination arrays are excluded, but source-side work is not:
 
-| Full scan | Bulk CSR | Generic visitor | 295 columns | 295 rows | list→array |
-|---|---:|---:|---:|---:|---:|
-| small | 248 B | 4.73 MiB | 2.63 MiB | 7.69 MiB | 2.63 MiB |
-| medium | 248 B | 52.08 MiB | 28.12 MiB | 82.00 MiB | 28.12 MiB |
-| large | 248 B | 156.44 MiB | 84.35 MiB | 246.01 MiB | 84.35 MiB |
+| Full scan | CSR64 | Heap bulk | Generic visitor | 295 columns | 295 rows | list→array |
+|---|---:|---:|---:|---:|---:|---:|
+| small | 208 B | 248 B | 1.52 MiB | 2.63 MiB | 7.69 MiB | 2.63 MiB |
+| medium | 208 B | 248 B | 17.84 MiB | 28.12 MiB | 82.00 MiB | 28.12 MiB |
+| large | 208 B | 248 B | 53.95 MiB | 48.35 MiB | 246.01 MiB | 48.35 MiB |
 
-Across all selection sizes and scales, `csr-copy-ranges!` allocates roughly
-248–320 bytes per invocation rather than per edge. That constant is protocol and
-range-iteration overhead; no selected payload or coordinate object is created.
-The generic visitor's cost remains visible and documented rather than being
-silently called “zero allocation.” DuckDB's JVM number is incomplete because
-`ThreadMXBean` cannot see native engine allocation.
+Across all selection sizes and scales, CSR64 allocates roughly 192–256 bytes per
+invocation rather than per edge. Heap `csr-copy-ranges!` remains at roughly
+248–320 bytes. No selected payload or coordinate object is created. The generic
+visitor's cost remains visible and documented rather than being silently called
+“zero allocation.” DuckDB's JVM number is incomplete because `ThreadMXBean`
+cannot see native engine allocation.
 
 #### Amortization
 
-Using the compact-file Parquet→CSR setup time and the fastest direct Parquet
-shape for each selection, the time-only break-even is approximately:
+Using the measured compact-file Parquet→COO→heap→loaded-CSR64 setup time and the
+fastest direct Parquet shape for each selection, the time-only break-even is
+approximately:
 
 | Scale | One-row visits | 64-row visits | Full visits |
 |---|---:|---:|---:|
-| small | 154 | 44 | 5 |
-| medium | 270 | 148 | 4 |
-| large | 253 | 180 | 3 |
+| small | 185 | 54 | 6 |
+| medium | 325 | 170 | 4 |
+| large | 297 | 210 | 3 |
 
 This excludes file generation, destination allocation, native memory, cold-cache
 effects, concurrency, and downstream compute. It is nevertheless decisive
@@ -972,6 +992,29 @@ Inserts and deletes add an ID-policy question: delta-only rows and columns use
 deciding whether IDs are snapshot-local or externally stable; otherwise two
 fast paths would be compared under different semantics.
 
+#### CSR64 alternative: compile an ordered modification ledger
+
+CSR64 resolves that ID question narrowly: row and column IDs are local to one
+immutable base generation, and the overlay may add coordinates only inside those
+existing numeric domains. [`csr64_overlay.clj`](../src/sparse_layout/csr64_overlay.clj)
+compiles a stable ledger cut with strictly increasing sequence numbers and
+last-write-wins coordinate semantics.
+
+Existing-coordinate puts are indexed by base entry ID. A query bulk-copies the
+mapped base, then overwrites only selected replacement blocks. Inserts and
+effective deletes mark a structural row; only those rows use a sorted merge.
+Cumulative structural count adjustments preserve range counts and logical page
+cursors without allocating another base-sized row-pointer array.
+
+On the same 590 MiB shape, 100,000 value replacements produced 42.439 ms median
+and 46.555 ms p99 for a full drain. A separate cut changing 1,000 rows with one
+delete and one insert per row produced 20.464 ms median and 23.538 ms p99. Both
+used 100 samples and passed the 50 ms ceiling in a repeat run; the worst
+structural p99 across both runs was 23.763 ms. Compile time was 342.5 ms and
+5.5 ms respectively. This makes 100,000 replacements a measured local
+compaction boundary, not a general constant. See the
+[full ledger-overlay design](csr64-modification-ledger-overlay.md).
+
 #### Limits of this run
 
 - Deterministic, uniform data; no nulls, duplicates, skew, or real Parquet file.
@@ -981,8 +1024,8 @@ fast paths would be compared under different semantics.
 - JVM current-thread allocation only; no DuckDB native RSS or peak live heap.
 - No direct Arrow IPC/ADBC path. That is a separate source format, not the stated
   Parquet scenario.
-- Heap and mmap bulk-copy correctness are covered; mmap throughput is not yet
-  benchmarked at production scale.
+- Heap, mmap, and compiled-ledger overlay correctness are covered; cold mapped
+  throughput and concurrent publication are not yet benchmarked.
 
 ### Decision after the run
 
@@ -992,7 +1035,7 @@ Before running, write numbers in this table:
 |---|---|
 | visits per snapshot (`Q`) | ______ |
 | typical / p99 selected entries per visit | ______ / ______ |
-| maximum materialization p99 | ______ |
+| maximum materialization p99 | 50 ms |
 | maximum JVM allocation per visit / selected entry | ______ / ______ |
 | maximum snapshot build time / peak RSS | ______ / ______ |
 | maximum cold-open time | ______ |
@@ -1005,8 +1048,10 @@ architecture mechanically:
 - **DuckDB meets every gate:** replace the custom engine.
 - **Observed here:** DuckDB misses repeated serving latency while retaining its
   data-management role, so use the hybrid and retain the small CSR index.
-- **Only bulk CSR meets the arena gates:** retain that boundary, not the rest of
-  the system by association.
+- **Observed large whole drain:** CSR64 also misses at 62.020 ms p99; retain the
+  bounded page ceiling rather than promising an unbounded full materialization.
+- **Only bounded CSR64 meets every measured arena gate:** retain that boundary,
+  not the rest of the system by association.
 - **The current full implementation uniquely wins a production workload:** keep
   it, and turn that workload into a continuous evidence threshold.
 
@@ -1135,11 +1180,11 @@ criterion is often permission to keep everything.
 
 ### Repository evidence reviewed
 
-- runtime source: 4,257 physical lines across `core`, `facade`, `csr_source`, its
-  protocols, and artifact code;
-- tests: 1,056 physical lines across three namespaces;
-- DuckDB comparison benchmark: 627 physical lines;
-- overlay-growth benchmark: 470 physical lines;
+- runtime source: 5,749 physical lines across `core`, `facade`, `csr_source`,
+  CSR64, the ledger overlay, its protocols, and artifact code;
+- tests: 1,361 physical lines across four namespaces;
+- DuckDB comparison benchmark: 689 physical lines;
+- CSR64 and ledger-overlay benchmark: 585 physical lines;
 - README, Bridge profile/policy, and current working-tree notebook; and
 - current test/benchmark structure and earlier recorded Bridge evidence.
 
@@ -1193,8 +1238,8 @@ object.
 **Context.** The project builds sparse coordinates with dense numerical payloads,
 then bulk-copies selected blocks into arrays preallocated by another system.
 Construction may allocate. On the 295-double production width, Parquet-derived
-CSR materialized the same outputs 26–49× faster for full scans and 489–3,917×
-faster for one-row scans than the best of three DuckDB Parquet shapes. The
+CSR64 materialized the same outputs 36–42× faster for full scans and
+326–4,597× faster for one-row scans than the best of three DuckDB Parquet shapes. The
 repository also owns sorting, duplicate resolution, CSR/CSC, query facades,
 deltas, and persistence.
 
@@ -1207,17 +1252,18 @@ persistence, transactions, filtering, and analytics. Because the final operation
 already copies values, engine-owned result chunks are compatible with the arena
 goal. The unresolved difference is query/chunk overhead versus precomputed CSR
 adjacency. The repository's defensible differentiator is the narrow
-`CSRSource` buffer-fill boundary, not the full generated storage ecosystem.
+bounded CSR64 buffer-fill boundary, not the full generated storage ecosystem.
 
 **Consequences.** Current first-seen IDs, duplicate order, and arbitrary key
 semantics must be classified as product guarantees or implementation details.
-Use `csr-copy-ranges!` for the arena contract and retain the generic visitor only
-where per-entry transformation is required. DuckDB 2.0 alpha remains research
-input, not a production target.
+Use CSR64 `copy-page!` for the arena contract and retain the generic visitor
+only where per-entry transformation is required. A 1.73 GiB single operation is
+outside that contract because its measured p99 was 62.020 ms. DuckDB 2.0 alpha
+remains research input, not a production target.
 
 **Reversal.** Cheap. If DuckDB passes all gates, delete the custom serving path.
 If it misses only repeated-serving gates, CSR remains a small derived index.
 
-> **Final thought:** construction is not the argument, but reuse is. A 5.8-second
+> **Final thought:** construction is not the argument, but reuse is. A 6.8-second
 > derivative is waste for one read and cheap for hundreds; the same bytes become
 > simple only after time is part of the value.

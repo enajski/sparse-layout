@@ -30,8 +30,14 @@
               :main-opts ["-m" "sparse-layout.construct"]}
   :duckdb-compare {:extra-paths ["bench"]
                    :extra-deps {net.mikera/vectorz-clj {:mvn/version "0.48.0"}
+                                io.github.yogthos/flatiron
+                                {:git/url "https://github.com/yogthos/flatiron.git"
+                                 :git/sha "fd27b76d6af097ab3211feffabda5d439ec6e4dd"}
                                 org.duckdb/duckdb_jdbc {:mvn/version "1.5.5.0"}}
+                   :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
                    :main-opts ["-m" "sparse-layout.duckdb-compare"]}
+  :compare-test {:extra-paths ["test"]
+                 :main-opts ["-e" "(require 'sparse-layout.flatiron-compare-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.flatiron-compare-test)] (when (pos? (+ fail error)) (System/exit 1)))"]}
   :overlay-compare {:extra-paths ["bench"]
                     :extra-deps {net.mikera/vectorz-clj {:mvn/version "0.48.0"}}
                     :main-opts ["-m" "sparse-layout.overlay-compare"]}

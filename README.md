@@ -549,24 +549,59 @@ clojure -M:bench smoke
 
 The matched serving benchmark pins DuckDB 1.5.5, uses a 295-double block per
 `(row-key, col-key)` edge, and fills the same preallocated `int[]`/`double[]`
-destinations through five contenders:
+destinations through seven contenders:
 
+- a preloaded Java 25 `MemorySegment` CSR64 artifact;
 - `csr-copy-ranges!` on a Parquet-derived `CSRSource`;
 - the same source's generic per-edge visitor;
+- Yogthos [Flatiron](https://github.com/yogthos/flatiron)'s graph CSR with a block sidecar;
 - Parquet with 295 scalar columns;
 - Parquet with 295 `(lane, value)` rows per edge; and
 - one Parquet list cast back to DuckDB `DOUBLE[295]` before projection.
 
 It verifies exact output equality before timing and reports Parquet generation,
-Parquet → COO → CSR construction, file size, median/p95 materialization time,
-and current-thread JVM allocation. DuckDB native allocation is not included.
+Parquet → COO → CSR construction, CSR64 write/open/preload time, file size,
+median/p95/p99 materialization time, the 50 ms result, and current-thread JVM
+allocation. CSR64 uses 100 measured samples; the slower controls use 5–30.
+DuckDB native allocation is not included.
+
+Flatiron is pinned to `fd27b76d6af097ab3211feffabda5d439ec6e4dd` in the
+benchmark-only alias. `flatiron-csr-sidecar` uses its real `graph/graph`
+constructor (including the reverse index), with scalar weights holding entry
+IDs into an owned 295-double-per-edge sidecar. The timed adapter traverses
+Flatiron's forward CSR arrays directly and copies full blocks, not just scalar
+weights. CSR → Flatiron + sidecar setup time/allocation is reported separately;
+this is not native Flatiron block storage or an independent Parquet ingest path.
+Run adapter regression tests with `clojure -M:duckdb-compare:compare-test`.
+The historical table below predates the Flatiron contender.
 
 ```sh
+sdk env
 clojure -M:duckdb-compare smoke
 clojure -J-Xmx4g -M:duckdb-compare small compound
 clojure -J-Xmx6g -M:duckdb-compare medium compound
 clojure -J-Xmx12g -M:duckdb-compare large-only compound
 ```
+
+The local Corretto 25 comparison reported:
+
+| Scale / selection | CSR64 median / p99 | Best DuckDB median / observed p99 | DuckDB shape |
+|---|---:|---:|---|
+| small / one row | 0.006 / 0.010 ms | 1.953 / 2.010 ms | 295 rows |
+| small / 64 rows | 0.074 / 0.103 ms | 6.809 / 6.874 ms | 295 rows |
+| small / full, 55 MiB | 2.052 / 2.532 ms | 73.990 / 80.361 ms | 295 columns |
+| medium / one row | 0.005 / 0.013 ms | 7.949 / 9.185 ms | 295 rows |
+| medium / 64 rows | 0.079 / 0.105 ms | 15.251 / 15.449 ms | 295 rows |
+| medium / full, 590 MiB | 18.558 / 21.463 ms | 783.775 / 821.306 ms | 295 columns |
+| large / one row | 0.005 / 0.011 ms | 22.986 / 24.060 ms | 295 rows |
+| large / 64 rows | 0.103 / 0.150 ms | 32.652 / 33.410 ms | 295 rows |
+| large / full, 1.73 GiB | 58.262 / 62.020 ms | 2,380.886 / 2,382.805 ms | 295 columns |
+
+CSR64 passes the 50 ms p99 ceiling through the 590 MiB full drain and for every
+measured one-row/64-row selection. A single 1.73 GiB drain fails, so the large
+command deliberately exits nonzero: that response must use bounded pages rather
+than one maximum-sized destination operation. DuckDB's 295-row shape remains
+under 50 ms for the selective cases but no DuckDB full drain does.
 
 Apache Parquet has no fixed-size-list logical type. The compact source is
 therefore read by DuckDB as `DOUBLE[]`; the benchmark casts it to

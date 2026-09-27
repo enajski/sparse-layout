@@ -1,5 +1,5 @@
 (ns sparse-layout.duckdb-compare
-  "Compares the CSR visitor with three Parquet encodings of 295-double blocks.
+  "Compares heap CSR, mapped CSR64, Flatiron CSR, and three Parquet encodings.
 
   Every timed path copies the same selected edges into caller-owned primitive
   arrays allocated before timing. Parquet generation and CSR construction are
@@ -8,7 +8,9 @@
   (:require [clojure.string :as str]
             [sparse-layout.bench-data :as data]
             [sparse-layout.core :as sparse]
-            [sparse-layout.csr-source :as csr])
+            [sparse-layout.csr-source :as csr]
+            [sparse-layout.csr64 :as csr64]
+            [sparse-layout.flatiron-compare :as flatiron])
   (:import [com.sun.management ThreadMXBean]
            [java.lang.management ManagementFactory]
            [java.nio.file Files Path]
@@ -18,6 +20,7 @@
             DuckDBPreparedStatement DuckDBReadableVector]))
 
 (def block-dim 295)
+(def latency-ceiling-ms 50.0)
 
 (sparse/defsparse comparison-features
                   {:row-key [:entity]
@@ -242,6 +245,22 @@
 
     #(csr/csr-copy-ranges! source ranges rows cols values 0)))
 
+(defn- csr64-runner
+  [source ^long start-row ^long end-row destination]
+  (let [rows
+        ^ints (:rows destination)
+
+        cols
+        ^ints (:cols destination)
+
+        values
+        ^doubles (:values destination)
+
+        edge-count
+        (alength rows)]
+
+    #(csr64/copy-page! source start-row end-row 0 edge-count rows cols values 0)))
+
 (defn- parquet-query
   [^Path path projection]
   (str "SELECT " projection
@@ -441,7 +460,9 @@
     (Arrays/sort allocations)
     {:median-ns (aget times (quot reps 2))
      :p95-ns (percentile times 0.95)
+     :p99-ns (percentile times 0.99)
      :median-allocated-bytes (aget allocations (quot reps 2))
+     :p99-under-50ms? (<= (percentile times 0.99) (* latency-ceiling-ms 1000000.0))
      :reps reps}))
 
 (defn- selection-specs
@@ -460,8 +481,10 @@
      {:selection :full :start 0 :end row-count}]))
 
 (defn- reps-for
-  [edge-count smoke?]
-  (if smoke? 1 (max 5 (min 30 (quot 3000000 (max 1 (* edge-count block-dim)))))))
+  [backend edge-count smoke?]
+  (cond smoke? 1
+        (= :csr64 backend) 100
+        :else (max 5 (min 30 (quot 3000000 (max 1 (* edge-count block-dim)))))))
 
 (defn- format-bytes
   [bytes]
@@ -474,7 +497,7 @@
         (recur (/ value 1024.0) (inc unit))))))
 
 (defn- print-setup
-  [{:keys [setup array-read-type]} sparse-build]
+  [{:keys [setup array-read-type]} sparse-build mapped-setup]
   (println (format "%-29s %12s %14s" "setup" "time" "JVM alloc/file"))
   (println (format "%-29s %10.1f ms %14s"
                    "Parquet list -> COO -> CSR"
@@ -484,6 +507,18 @@
                    "DuckDB normalized ARRAY table"
                    (get-in setup [:duckdb-base :ms])
                    (format-bytes (get-in setup [:duckdb-base :allocated-bytes]))))
+  (println (format "%-29s %10.1f ms %14s"
+                   "Write CSR64 artifact"
+                   (get-in mapped-setup [:write :ms])
+                   (format-bytes (:bytes mapped-setup))))
+  (println (format "%-29s %10.1f ms %14s"
+                   "Open + validate CSR64"
+                   (get-in mapped-setup [:open :ms])
+                   (format-bytes (get-in mapped-setup [:open :allocated-bytes]))))
+  (println (format "%-29s %10.1f ms %14s"
+                   "Preload CSR64"
+                   (get-in mapped-setup [:load :ms])
+                   (if (:loaded? mapped-setup) "loaded" "not loaded")))
   (doseq [[label key] [["Parquet: 295 columns" :column-explosion]
                        ["Parquet: 295 rows/edge" :row-explosion]
                        ["Parquet: 295-value list" :array-list]]]
@@ -494,18 +529,21 @@
   (println "DuckDB type after Parquet round-trip:" array-read-type))
 
 (defn- print-result
-  [{:keys [selection backend entries median-ns p95-ns median-allocated-bytes reps]}]
-  (println (format "%-10s %-24s %,9d %10.3f %10.3f %12s %5d"
+  [{:keys [selection backend entries median-ns p95-ns p99-ns median-allocated-bytes reps
+           p99-under-50ms?]}]
+  (println (format "%-10s %-24s %,9d %10.3f %10.3f %10.3f %12s %5d %7s"
                    (name selection)
                    (name backend)
                    entries
                    (/ median-ns 1000000.0)
                    (/ p95-ns 1000000.0)
+                   (/ p99-ns 1000000.0)
                    (format-bytes median-allocated-bytes)
-                   reps)))
+                   reps
+                   (if p99-under-50ms? "PASS" "FAIL"))))
 
 (defn- run-selection
-  [^DuckDBConnection connection source paths config selection smoke?]
+  [^DuckDBConnection connection source mapped-source flatiron-source paths config selection smoke?]
   (let [{:keys [start end]}
         selection
 
@@ -525,8 +563,10 @@
         (str "row_id, col_id, " (str/join ", " (map #(str "p" %) (range block-dim))))
 
         runners
-        [[:sparse-bulk (sparse-bulk-runner source start end expected) expected]
+        [[:csr64 (csr64-runner mapped-source start end actual) actual]
+         [:sparse-bulk (sparse-bulk-runner source start end expected) expected]
          [:sparse-visitor (sparse-visitor-runner source start end actual) actual]
+         [:flatiron-csr-sidecar (flatiron/runner flatiron-source start end actual) actual]
          [:parquet-295-columns
           (projected-runner connection (:column-explosion paths) wide-projection start end actual)
           actual]
@@ -535,18 +575,17 @@
           (projected-runner connection (:array-list paths) projection start end actual) actual]]
 
         baseline-count
-        ((second (first runners)))]
+        ((second (second runners)))]
 
     (assert (= edge-count baseline-count))
-    (doseq [[backend runner output] (rest runners)]
+    (doseq [[backend runner output] (concat [(first runners)] (drop 2 runners))]
       (assert (= edge-count (long (runner))) (str backend " returned the wrong edge count"))
       (assert (same-output? expected output) (str backend " output differs from sparse CSR")))
-    (let [reps (reps-for edge-count smoke?)]
-      (mapv (fn [[backend runner _]]
-              (merge selection
-                     {:backend backend :entries edge-count}
-                     (measure runner edge-count reps)))
-            runners))))
+    (mapv (fn [[backend runner _]]
+            (merge selection
+                   {:backend backend :entries edge-count}
+                   (measure runner edge-count (reps-for backend edge-count smoke?))))
+          runners)))
 
 (defn- delete-tree!
   [^Path directory]
@@ -571,32 +610,64 @@
   (println "Logical payload bytes:" (format-bytes (* (data/nnz config) block-dim 8)))
   (let [directory (Files/createTempDirectory "sparse-layout-duckdb-"
                                              (make-array java.nio.file.attribute.FileAttribute 0))]
-    (try (let [col-ids (raw-col->id config)
-               parquet (generate-parquet! config col-ids directory)
-               sparse-build (timed #(parquet->sparse-source config
-                                                            col-ids
-                                                            (get-in parquet [:paths :array-list])))
-               source (:value sparse-build)]
+    (try
+      (let [col-ids (raw-col->id config)
+            parquet (generate-parquet! config col-ids directory)
+            sparse-build
+            (timed #(parquet->sparse-source config col-ids (get-in parquet [:paths :array-list])))
+            source (:value sparse-build)
+            flatiron-build (timed #(flatiron/from-source source))
+            mapped-path (.resolve directory "source.slcsr64")
+            mapped-write (timed #(csr64/write-artifact! source mapped-path))
+            mapped-open (timed #(csr64/open-artifact mapped-path))]
 
-           (assert (= block-dim (csr/csr-block-dim source)))
-           (assert (= (data/nnz config) (csr/csr-entry-count source)))
-           (print-setup parquet sparse-build)
-           (println)
-           (println (format "%-10s %-24s %9s %10s %10s %12s %5s" "selection"
-                            "backend" "edges"
-                            "median ms" "p95 ms"
-                            "alloc/call" "reps"))
-           (with-open [connection (open-duckdb)]
-             (let [results
-                   (vec (mapcat #(run-selection connection source (:paths parquet) config % smoke?)
-                                (selection-specs config)))]
-               (doseq [result results]
-                 (print-result result))
-               {:config config
-                :setup (dissoc (:setup parquet) :value)
-                :array-read-type (:array-read-type parquet)
-                :results results})))
-         (finally (delete-tree! directory)))))
+        (assert (= block-dim (csr/csr-block-dim source)))
+        (assert (= (data/nnz config) (csr/csr-entry-count source)))
+        (with-open [^java.io.Closeable mapped-source (:value mapped-open)]
+          (let [mapped-load (timed #(csr64/load! mapped-source))
+                mapped-setup {:write mapped-write
+                              :open mapped-open
+                              :load mapped-load
+                              :bytes (Files/size mapped-path)
+                              :loaded? (csr64/loaded? mapped-source)}]
+
+            (assert (= block-dim (csr/csr-block-dim mapped-source)))
+            (assert (= (data/nnz config) (csr/csr-entry-count mapped-source)))
+            (print-setup parquet sparse-build mapped-setup)
+            (println (format "%-29s %10.1f ms %14s"
+                             "CSR -> Flatiron + sidecar"
+                             (:ms flatiron-build)
+                             (format-bytes (:allocated-bytes flatiron-build))))
+            (println)
+            (println (format "%-10s %-24s %9s %10s %10s %10s %12s %5s %7s" "selection"
+                             "backend" "edges"
+                             "median ms" "p95 ms"
+                             "p99 ms" "alloc/call"
+                             "reps" "<50ms"))
+            (with-open [connection (open-duckdb)]
+              (let [results (vec (mapcat #(run-selection connection
+                                                         source
+                                                         mapped-source
+                                                         (:value flatiron-build)
+                                                         (:paths parquet)
+                                                         config
+                                                         %
+                                                         smoke?)
+                                         (selection-specs config)))
+                    failures (filterv #(and (= :csr64 (:backend %)) (not (:p99-under-50ms? %)))
+                               results)]
+
+                (doseq [result results]
+                  (print-result result))
+                (when (seq failures)
+                  (throw (ex-info "CSR64 latency ceiling failed." {:failures failures})))
+                {:config config
+                 :setup (dissoc (:setup parquet) :value)
+                 :flatiron-setup (dissoc flatiron-build :value)
+                 :csr64-setup (select-keys mapped-setup [:bytes :loaded?])
+                 :array-read-type (:array-read-type parquet)
+                 :results results})))))
+      (finally (delete-tree! directory)))))
 
 (defn- smoke-config
   []
@@ -618,7 +689,7 @@
         configs
         (if smoke? [(smoke-config)] (data/selected-configs selection-args))]
 
-    (println "DuckDB" (duckdb-version) "vs sparse-layout CSR")
+    (println "DuckDB" (duckdb-version) "vs sparse-layout heap CSR, mapped CSR64, and Flatiron CSR")
     (println "Three Parquet shapes; outputs are reused int[]/double[] destinations.")
     (println
       "DuckDB chunked results cannot expose nested columns, so the list is projected to doubles.")
