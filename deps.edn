@@ -1,7 +1,10 @@
 {:paths ["src"]
  :aliases
- {:test {:extra-paths ["test"]
-         :main-opts ["-e" "(do (require 'clojure.test 'sparse-layout.core-test 'sparse-layout.facade-test 'sparse-layout.csr-source-test 'sparse-layout.csr64-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.core-test 'sparse-layout.facade-test 'sparse-layout.csr-source-test 'sparse-layout.csr64-test)] (when (pos? (+ fail error)) (System/exit 1))))"]}
+  {:build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.10"}
+                  slipset/deps-deploy {:mvn/version "0.2.2"}}
+           :ns-default build}
+   :test {:extra-paths ["test"]
+          :main-opts ["-e" "(do (require 'clojure.test 'sparse-layout.core-test 'sparse-layout.facade-test 'sparse-layout.csr-source-test 'sparse-layout.csr64-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.core-test 'sparse-layout.facade-test 'sparse-layout.csr-source-test 'sparse-layout.csr64-test)] (when (pos? (+ fail error)) (System/exit 1))))"]}
   :lint {:extra-deps {io.github.enajski/codestyle
                       {:git/url "https://github.com/enajski/codestyle.git"
                        :git/sha "658ee7f67a91dbe3f08c10b68d7c9f4107cb6a4f"}}

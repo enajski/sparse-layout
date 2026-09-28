@@ -692,3 +692,24 @@ clojure -M:construct compound medium
 
 This alias is intended as a local validation tool; long-form construction notes
 are maintained in the project wiki rather than this repository.
+
+## Local Clojars release setup
+
+The release coordinate is `io.github.enajski/sparse-layout` at `0.1.0`.
+Build and inspect the library artifact locally before publishing:
+
+```sh
+clojure -M:test
+clojure -T:build jar
+jar tf target/sparse-layout-0.1.0.jar
+cat target/classes/META-INF/maven/io.github.enajski/sparse-layout/pom.xml
+```
+
+The JAR contains `src` only; prototype, benchmark and notebook dependencies are
+not release dependencies. Check the intended source revision and version before
+uploading: a released Clojars version cannot be overwritten. When authorized to
+publish, set `CLOJARS_USERNAME` and `CLOJARS_PASSWORD` (a Clojars deploy token)
+in your local environment, then run `clojure -T:build deploy`. Do not put the
+token in a repository file or command argument. The deploy command rebuilds
+the JAR and refuses to upload if either credential is missing. This setup does
+not publish automatically.
