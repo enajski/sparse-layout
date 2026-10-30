@@ -230,6 +230,83 @@
                       (fn [_ mmap]
                         (is (= expected (copied-ranges mmap)))))))
 
+(deftest heap-and-mmap-accept-the-same-range-and-prefix-forms
+  (let [heap (csr/dataset->csr-source (test-dataset))]
+    (roundtrip-source
+      heap
+      (fn [_ mmap]
+        (doseq [source [heap mmap]]
+          (doseq [r [{:row-start 0 :row-end 2} [0 2] '(0 2)]]
+            (let [rows (int-array 3)
+                  cols (int-array 3)
+                  values (double-array 9)
+                  visited (atom [])]
+
+              (is (= 3 (csr/csr-copy-ranges! source [r] rows cols values 0)))
+              (is (= [0 0 1] (vec rows)))
+              (is (= [0 1 0] (vec cols)))
+              (is (= [1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0] (vec values)))
+              (csr/csr-scan-ranges! source
+                                    [r]
+                                    (fn [row-id col-id entry-id _]
+                                      (swap! visited conj [row-id col-id entry-id])))
+              (is (= [[0 0 0] [0 1 1] [1 0 2]] @visited))
+              (is (= [r] (csr/csr-resolve-ranges source {:range r})))
+              (is (= [r] (csr/csr-resolve-ranges source {:ranges [r]})))))
+          (doseq [selection [nil {} {:prefix nil} {:prefix []} {:prefix '()}]]
+            (is (= [{:row-start 0 :row-end 4}] (csr/csr-resolve-ranges source selection))))
+          (let [indexed (csr/with-range-index source identity)]
+            (doseq [prefix [:tenant-a [:tenant-a] '(:tenant-a)]]
+              (is (= [{:row-start 0 :row-end 3}]
+                     (csr/csr-resolve-ranges indexed {:prefix prefix}))))))))))
+
+(deftest heap-and-mmap-reject-invalid-range-copies-before-writing
+  (let [heap (csr/dataset->csr-source (test-dataset))]
+    (roundtrip-source heap
+                      (fn [_ mmap]
+                        (doseq [source [heap mmap]
+                                [ranges row-capacity col-capacity value-capacity offset message]
+                                [[[[0 1] [-1 1]] 5 5 15 0 #"CSR row range is out of bounds"]
+                                 [[:invalid] 5 5 15 0 #"Unsupported CSR row range"]
+                                 [[[2 1]] 5 5 15 0 #"CSR row range is out of bounds"]
+                                 [[[0 5]] 5 5 15 0 #"CSR row range is out of bounds"]
+                                 [[[0 2]] 2 3 9 0 #"CSR range copy destination is out of bounds"]
+                                 [[[0 2]] 3 2 9 0 #"CSR range copy destination is out of bounds"]
+                                 [[[0 2]] 3 3 8 0 #"CSR range copy destination is out of bounds"]
+                                 [[[0 2]] 3 3 9 -1 #"CSR range copy destination is out of bounds"]
+                                 [[[0 2]] 3 3 9 1 #"CSR range copy destination is out of bounds"]]]
+
+                          (let [rows (int-array row-capacity -1)
+                                cols (int-array col-capacity -1)
+                                values (double-array value-capacity -1.0)]
+
+                            (is (thrown-with-msg?
+                                  clojure.lang.ExceptionInfo
+                                  message
+                                  (csr/csr-copy-ranges! source ranges rows cols values offset)))
+                            (is (= (repeat row-capacity -1) (seq rows)))
+                            (is (= (repeat col-capacity -1) (seq cols)))
+                            (is (= (repeat value-capacity -1.0) (seq values)))))))))
+
+(deftest heap-and-mmap-reject-invalid-block-copies-before-writing
+  (let [heap (csr/dataset->csr-source (test-dataset))]
+    (roundtrip-source heap
+                      (fn [_ mmap]
+                        (doseq [source [heap mmap]
+                                [entry-id offset capacity message]
+                                [[-1 0 3 #"CSRSource index is out of bounds"]
+                                 [5 0 3 #"CSRSource index is out of bounds"]
+                                 [0 -1 3 #"CSRSource copy destination is out of bounds"]
+                                 [0 1 3 #"CSRSource copy destination is out of bounds"]
+                                 [0 0 2 #"CSRSource copy destination is out of bounds"]]]
+
+                          (let [values (double-array capacity -1.0)]
+                            (is (thrown-with-msg?
+                                  clojure.lang.ExceptionInfo
+                                  message
+                                  (csr/csr-copy-block! source entry-id values offset)))
+                            (is (= (repeat capacity -1.0) (seq values)))))))))
+
 (deftest writes-language-neutral-artifact-header
   (let [bytes (artifact-bytes (csr/dataset->csr-source (test-dataset)))]
     (is (= (concat (mapv #(bit-and (int %) 0xff) (artifact-magic-bytes))
