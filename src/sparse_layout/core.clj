@@ -395,9 +395,9 @@
           (aset out i (aget data (aget ids i))))
         {:payload-values out :payload-ptrs nil})))
 
-(deftype FixedDoubleBlockPayloadBuffer [^long dim ^DoubleBuffer values ^IntBuffer count]
+(deftype FixedDoubleBlockPayloadBuffer [^long dim ^DoubleBuffer values]
   PayloadBuffer
-    (-append-payload! [_ value] (append-fixed-double-block! values dim value) (ib-add! count 1))
+    (-append-payload! [_ value] (append-fixed-double-block! values dim value))
     (-payload-at [_ edge-id]
       (let [out
             (double-array dim)
@@ -407,7 +407,7 @@
 
         (System/arraycopy (buf-data values) (int start) out 0 (int dim))
         out))
-    (-payload-count [_] (ib-size count))
+    (-payload-count [_] (quot (db-size values) dim))
     (-payload-kind [_] :fixed-double-block)
     (-payload-dim [_] dim)
     (-gather-storage [_ ids m]
@@ -498,7 +498,7 @@
     (ObjectPayloadBuffer. (object-buffer))
 
     :fixed-double-block
-    (FixedDoubleBlockPayloadBuffer. (long (:dim payload)) (double-buffer) (int-buffer))
+    (FixedDoubleBlockPayloadBuffer. (long (:dim payload)) (double-buffer))
 
     :var-double-block
     (let [ptrs (int-buffer)]
@@ -863,20 +863,15 @@
 (defn- build-csr
   [indices ^ints edge-rows ^ints edge-cols row-count nnz]
   (when (contains? indices :csr)
-    (let [row-ptrs
-          (int-array (inc row-count))
-
-          col-ids
-          (int-array nnz)]
-
+    (let [row-ptrs (int-array (inc row-count))]
       (dotimes [payload-id nnz]
         (let [row (aget edge-rows payload-id)]
           (aset row-ptrs (inc row) (inc (aget row-ptrs (inc row))))))
       (dotimes [row row-count]
         (aset row-ptrs (inc row) (+ (aget row-ptrs row) (aget row-ptrs (inc row)))))
-      (dotimes [payload-id nnz]
-        (aset col-ids payload-id (aget edge-cols payload-id)))
-      {:csr-row-ptrs row-ptrs :csr-col-ids col-ids})))
+      ;; Coalescing already produces column ids in CSR order. Both references
+      ;; belong to this frozen snapshot; callers must treat the arrays as read-only.
+      {:csr-row-ptrs row-ptrs :csr-col-ids edge-cols})))
 
 (defn- build-csc
   "Builds the CSC index from coalesced, (row, col)-sorted edges with a single
@@ -1143,41 +1138,38 @@
       (System/arraycopy values start out 0 length)
       out)))
 
+;; Primitive payload IDs avoid per-entry boxes in shared view traversals.
+(defn- fixed-payload-view
+  [payload-values ^long payload-dim ^long payload-id]
+  (DoubleBlockView. ^doubles payload-values (int (* payload-id payload-dim)) (int payload-dim)))
+
+(defn- variable-payload-view
+  [payload-values payload-ptrs ^long payload-id]
+  (let [ptrs
+        ^ints payload-ptrs
+
+        start
+        (aget ptrs (int payload-id))
+
+        end
+        (aget ptrs (inc (int payload-id)))]
+
+    (DoubleBlockView. ^doubles payload-values start (- end start))))
+
+(defn- require-block-payload!
+  [payload-kind]
+  (when-not (or (= :fixed-double-block payload-kind) (= :var-double-block payload-kind))
+    (throw (ex "Zero-copy block views require block payload storage."
+               {:payload-kind payload-kind}))))
+
 (defn payload-view
   [payload-kind payload-dim payload-values payload-ptrs payload-id]
   (case payload-kind
     :fixed-double-block
-    (let [values
-          ^doubles payload-values
-
-          payload-id
-          (long payload-id)
-
-          payload-dim
-          (long payload-dim)
-
-          start
-          (* payload-id payload-dim)]
-
-      (DoubleBlockView. values (int start) (int payload-dim)))
+    (fixed-payload-view payload-values (long payload-dim) (long payload-id))
 
     :var-double-block
-    (let [values
-          ^doubles payload-values
-
-          payload-ptrs
-          ^ints payload-ptrs
-
-          payload-id
-          (long payload-id)
-
-          start
-          (aget payload-ptrs (int payload-id))
-
-          end
-          (aget payload-ptrs (inc (int payload-id)))]
-
-      (DoubleBlockView. values start (- end start)))
+    (variable-payload-view payload-values payload-ptrs (long payload-id))
 
     (throw (ex "Zero-copy block views require block payload storage."
                {:payload-kind payload-kind}))))
@@ -1258,197 +1250,170 @@
       (when-not (= -1 payload-id)
         (payload-view payload-kind payload-dim payload-values payload-ptrs payload-id)))))
 
-(defn row-blocks-by-id
-  [row-id id-to-col csr-col-ids csr-row-ptrs payload-kind payload-dim payload-values payload-ptrs]
+(defn- row-blocks-by-id*
+  [views? row-id id-to-col csr-col-ids csr-row-ptrs payload-kind payload-dim payload-values
+   payload-ptrs]
   (cond (neg? row-id) []
         (nil? csr-row-ptrs) (throw (ex "CSR index was not compiled for row traversal."
                                        {:required :csr}))
-        :else (let [id-to-col
-                    ^objects id-to-col
+        :else
+        (let [id-to-col
+              ^objects id-to-col
 
-                    csr-col-ids
-                    ^ints csr-col-ids
+              csr-col-ids
+              ^ints csr-col-ids
 
-                    csr-row-ptrs
-                    ^ints csr-row-ptrs
+              csr-row-ptrs
+              ^ints csr-row-ptrs
 
-                    row-id
-                    (long row-id)
+              row-id
+              (long row-id)
 
-                    start
-                    (aget csr-row-ptrs (int row-id))
+              start
+              (aget csr-row-ptrs (int row-id))
 
-                    end
-                    (aget csr-row-ptrs (inc (int row-id)))]
+              end
+              (aget csr-row-ptrs (inc (int row-id)))]
 
-                (loop [i
-                       start
+          (when (and views? (< start end)) (require-block-payload! payload-kind))
+          (loop [i
+                 start
 
-                       out
-                       (transient [])]
+                 out
+                 (transient [])]
 
-                  (if (= i end)
-                    (persistent! out)
-                    (let [payload-id
-                          i
+            (if (= i end)
+              (persistent! out)
+              (let [payload-id
+                    i
 
-                          col-id
-                          (aget csr-col-ids i)]
+                    col-id
+                    (aget csr-col-ids i)]
 
-                      (recur (inc i)
-                             (conj! out
-                                    [(aget id-to-col col-id)
-                                     (payload-value payload-kind
-                                                    payload-dim
-                                                    payload-values
-                                                    payload-ptrs
-                                                    payload-id)]))))))))
+                (recur
+                  (inc i)
+                  (conj!
+                    out
+                    [(aget id-to-col col-id)
+                     (if views?
+                       (if (= :fixed-double-block payload-kind)
+                         (fixed-payload-view payload-values (long payload-dim) (long payload-id))
+                         (variable-payload-view payload-values payload-ptrs (long payload-id)))
+                       (payload-value payload-kind
+                                      payload-dim
+                                      payload-values
+                                      payload-ptrs
+                                      payload-id))]))))))))
+
+(defn row-blocks-by-id
+  [row-id id-to-col csr-col-ids csr-row-ptrs payload-kind payload-dim payload-values payload-ptrs]
+  (row-blocks-by-id* false
+                     row-id
+                     id-to-col
+                     csr-col-ids
+                     csr-row-ptrs
+                     payload-kind
+                     payload-dim
+                     payload-values
+                     payload-ptrs))
 
 (defn row-block-views-by-id
   [row-id id-to-col csr-col-ids csr-row-ptrs payload-kind payload-dim payload-values payload-ptrs]
-  (cond (neg? row-id) []
-        (nil? csr-row-ptrs) (throw (ex "CSR index was not compiled for row traversal."
-                                       {:required :csr}))
-        :else (let [id-to-col
-                    ^objects id-to-col
+  (row-blocks-by-id* true
+                     row-id
+                     id-to-col
+                     csr-col-ids
+                     csr-row-ptrs
+                     payload-kind
+                     payload-dim
+                     payload-values
+                     payload-ptrs))
 
-                    csr-col-ids
-                    ^ints csr-col-ids
+(defn- col-blocks-by-id*
+  [views? col-id id-to-row csc-row-ids csc-col-ptrs csc-payload-ids payload-kind payload-dim
+   payload-values payload-ptrs]
+  (cond (neg? col-id) []
+        (nil? csc-col-ptrs) (throw (ex "CSC index was not compiled for column traversal."
+                                       {:required :csc}))
+        :else
+        (let [id-to-row
+              ^objects id-to-row
 
-                    csr-row-ptrs
-                    ^ints csr-row-ptrs
+              csc-row-ids
+              ^ints csc-row-ids
+
+              csc-col-ptrs
+              ^ints csc-col-ptrs
+
+              csc-payload-ids
+              ^ints csc-payload-ids
+
+              col-id
+              (long col-id)
+
+              start
+              (aget csc-col-ptrs (int col-id))
+
+              end
+              (aget csc-col-ptrs (inc (int col-id)))]
+
+          (when (and views? (< start end)) (require-block-payload! payload-kind))
+          (loop [i
+                 start
+
+                 out
+                 (transient [])]
+
+            (if (= i end)
+              (persistent! out)
+              (let [payload-id
+                    (aget csc-payload-ids i)
 
                     row-id
-                    (long row-id)
+                    (aget csc-row-ids i)]
 
-                    start
-                    (aget csr-row-ptrs (int row-id))
-
-                    end
-                    (aget csr-row-ptrs (inc (int row-id)))]
-
-                (loop [i
-                       start
-
-                       out
-                       (transient [])]
-
-                  (if (= i end)
-                    (persistent! out)
-                    (let [payload-id
-                          i
-
-                          col-id
-                          (aget csr-col-ids i)]
-
-                      (recur (inc i)
-                             (conj! out
-                                    [(aget id-to-col col-id)
-                                     (payload-view payload-kind
-                                                   payload-dim
-                                                   payload-values
-                                                   payload-ptrs
-                                                   payload-id)]))))))))
+                (recur
+                  (inc i)
+                  (conj!
+                    out
+                    [(aget id-to-row row-id)
+                     (if views?
+                       (if (= :fixed-double-block payload-kind)
+                         (fixed-payload-view payload-values (long payload-dim) (long payload-id))
+                         (variable-payload-view payload-values payload-ptrs (long payload-id)))
+                       (payload-value payload-kind
+                                      payload-dim
+                                      payload-values
+                                      payload-ptrs
+                                      payload-id))]))))))))
 
 (defn col-blocks-by-id
   [col-id id-to-row csc-row-ids csc-col-ptrs csc-payload-ids payload-kind payload-dim payload-values
    payload-ptrs]
-  (cond (neg? col-id) []
-        (nil? csc-col-ptrs) (throw (ex "CSC index was not compiled for column traversal."
-                                       {:required :csc}))
-        :else (let [id-to-row
-                    ^objects id-to-row
-
-                    csc-row-ids
-                    ^ints csc-row-ids
-
-                    csc-col-ptrs
-                    ^ints csc-col-ptrs
-
-                    csc-payload-ids
-                    ^ints csc-payload-ids
-
-                    col-id
-                    (long col-id)
-
-                    start
-                    (aget csc-col-ptrs (int col-id))
-
-                    end
-                    (aget csc-col-ptrs (inc (int col-id)))]
-
-                (loop [i
-                       start
-
-                       out
-                       (transient [])]
-
-                  (if (= i end)
-                    (persistent! out)
-                    (let [payload-id
-                          (aget csc-payload-ids i)
-
-                          row-id
-                          (aget csc-row-ids i)]
-
-                      (recur (inc i)
-                             (conj! out
-                                    [(aget id-to-row row-id)
-                                     (payload-value payload-kind
-                                                    payload-dim
-                                                    payload-values
-                                                    payload-ptrs
-                                                    payload-id)]))))))))
+  (col-blocks-by-id* false
+                     col-id
+                     id-to-row
+                     csc-row-ids
+                     csc-col-ptrs
+                     csc-payload-ids
+                     payload-kind
+                     payload-dim
+                     payload-values
+                     payload-ptrs))
 
 (defn col-block-views-by-id
   [col-id id-to-row csc-row-ids csc-col-ptrs csc-payload-ids payload-kind payload-dim payload-values
    payload-ptrs]
-  (cond (neg? col-id) []
-        (nil? csc-col-ptrs) (throw (ex "CSC index was not compiled for column traversal."
-                                       {:required :csc}))
-        :else (let [id-to-row
-                    ^objects id-to-row
-
-                    csc-row-ids
-                    ^ints csc-row-ids
-
-                    csc-col-ptrs
-                    ^ints csc-col-ptrs
-
-                    csc-payload-ids
-                    ^ints csc-payload-ids
-
-                    col-id
-                    (long col-id)
-
-                    start
-                    (aget csc-col-ptrs (int col-id))
-
-                    end
-                    (aget csc-col-ptrs (inc (int col-id)))]
-
-                (loop [i
-                       start
-
-                       out
-                       (transient [])]
-
-                  (if (= i end)
-                    (persistent! out)
-                    (let [payload-id
-                          (aget csc-payload-ids i)
-
-                          row-id
-                          (aget csc-row-ids i)]
-
-                      (recur (inc i)
-                             (conj! out
-                                    [(aget id-to-row row-id)
-                                     (payload-view payload-kind
-                                                   payload-dim
-                                                   payload-values
-                                                   payload-ptrs
-                                                   payload-id)]))))))))
+  (col-blocks-by-id* true
+                     col-id
+                     id-to-row
+                     csc-row-ids
+                     csc-col-ptrs
+                     csc-payload-ids
+                     payload-kind
+                     payload-dim
+                     payload-values
+                     payload-ptrs))
 
 (defn- pascal-case
   [value]
@@ -1716,93 +1681,15 @@
            (doseq [record# records#]
              (~ingest-name builder# record#))
            (~freeze-name builder#)))
-       (defn ~row-id-name
-         [~ds-sym row-key#]
-         (sparse-layout.core/id-of (.-rowToId ~ds-sym) row-key#))
-       (defn ~col-id-name
-         [~ds-sym col-key#]
-         (sparse-layout.core/id-of (.-colToId ~ds-sym) col-key#))
-       (defn ~row-name
-         [~ds-sym row-key#]
-         (let [row-id# (sparse-layout.core/id-of (.-rowToId ~ds-sym) row-key#)]
-           (sparse-layout.core/row-blocks-by-id row-id#
-                                                (.-idToCol ~ds-sym)
-                                                (.-csrColIds ~ds-sym)
-                                                (.-csrRowPtrs ~ds-sym)
-                                                (.-payloadKind ~ds-sym)
-                                                (.-payloadDim ~ds-sym)
-                                                (.-payloadValues ~ds-sym)
-                                                (.-payloadPtrs ~ds-sym))))
-       (defn ~col-name
-         [~ds-sym col-key#]
-         (let [col-id# (sparse-layout.core/id-of (.-colToId ~ds-sym) col-key#)]
-           (sparse-layout.core/col-blocks-by-id col-id#
-                                                (.-idToRow ~ds-sym)
-                                                (.-cscRowIds ~ds-sym)
-                                                (.-cscColPtrs ~ds-sym)
-                                                (.-cscPayloadIds ~ds-sym)
-                                                (.-payloadKind ~ds-sym)
-                                                (.-payloadDim ~ds-sym)
-                                                (.-payloadValues ~ds-sym)
-                                                (.-payloadPtrs ~ds-sym))))
-       (defn ~row-views-name
-         [~ds-sym row-key#]
-         (let [row-id# (sparse-layout.core/id-of (.-rowToId ~ds-sym) row-key#)]
-           (sparse-layout.core/row-block-views-by-id row-id#
-                                                     (.-idToCol ~ds-sym)
-                                                     (.-csrColIds ~ds-sym)
-                                                     (.-csrRowPtrs ~ds-sym)
-                                                     (.-payloadKind ~ds-sym)
-                                                     (.-payloadDim ~ds-sym)
-                                                     (.-payloadValues ~ds-sym)
-                                                     (.-payloadPtrs ~ds-sym))))
-       (defn ~col-views-name
-         [~ds-sym col-key#]
-         (let [col-id# (sparse-layout.core/id-of (.-colToId ~ds-sym) col-key#)]
-           (sparse-layout.core/col-block-views-by-id col-id#
-                                                     (.-idToRow ~ds-sym)
-                                                     (.-cscRowIds ~ds-sym)
-                                                     (.-cscColPtrs ~ds-sym)
-                                                     (.-cscPayloadIds ~ds-sym)
-                                                     (.-payloadKind ~ds-sym)
-                                                     (.-payloadDim ~ds-sym)
-                                                     (.-payloadValues ~ds-sym)
-                                                     (.-payloadPtrs ~ds-sym))))
-       (defn ~block-name
-         [~ds-sym row-key# col-key#]
-         (let [row-id#
-               (sparse-layout.core/id-of (.-rowToId ~ds-sym) row-key#)
-
-               col-id#
-               (sparse-layout.core/id-of (.-colToId ~ds-sym) col-key#)]
-
-           (sparse-layout.core/block-by-ids row-id#
-                                            col-id#
-                                            (.-csrRowPtrs ~ds-sym)
-                                            (.-csrColIds ~ds-sym)
-                                            (.-cscColPtrs ~ds-sym)
-                                            (.-cscRowIds ~ds-sym)
-                                            (.-cscPayloadIds ~ds-sym)
-                                            (.-payloadKind ~ds-sym)
-                                            (.-payloadDim ~ds-sym)
-                                            (.-payloadValues ~ds-sym)
-                                            (.-payloadPtrs ~ds-sym))))
+       ;; Call the type's protocol methods directly: one implementation per query,
+       ;; without reflective or generic protocol dispatch in the generated API.
+       (defn ~row-id-name [~ds-sym row-key#] (.row_id ~ds-sym row-key#))
+       (defn ~col-id-name [~ds-sym col-key#] (.col_id ~ds-sym col-key#))
+       (defn ~row-name [~ds-sym row-key#] (.row_blocks ~ds-sym row-key#))
+       (defn ~col-name [~ds-sym col-key#] (.col_blocks ~ds-sym col-key#))
+       (defn ~row-views-name [~ds-sym row-key#] (.row_block_views ~ds-sym row-key#))
+       (defn ~col-views-name [~ds-sym col-key#] (.col_block_views ~ds-sym col-key#))
+       (defn ~block-name [~ds-sym row-key# col-key#] (.block ~ds-sym row-key# col-key#))
        (defn ~block-view-name
          [~ds-sym row-key# col-key#]
-         (let [row-id#
-               (sparse-layout.core/id-of (.-rowToId ~ds-sym) row-key#)
-
-               col-id#
-               (sparse-layout.core/id-of (.-colToId ~ds-sym) col-key#)]
-
-           (sparse-layout.core/block-view-by-ids row-id#
-                                                 col-id#
-                                                 (.-csrRowPtrs ~ds-sym)
-                                                 (.-csrColIds ~ds-sym)
-                                                 (.-cscColPtrs ~ds-sym)
-                                                 (.-cscRowIds ~ds-sym)
-                                                 (.-cscPayloadIds ~ds-sym)
-                                                 (.-payloadKind ~ds-sym)
-                                                 (.-payloadDim ~ds-sym)
-                                                 (.-payloadValues ~ds-sym)
-                                                 (.-payloadPtrs ~ds-sym)))))))
+         (.block_view ~ds-sym row-key# col-key#)))))

@@ -135,14 +135,20 @@
         (variable-features-block-view ds 2 :xs)]
 
     (is (= [4.0 5.0 6.0] (materialize-view view)))
+    (is (= [[:xs [1.0 2.0]] [:ys [3.0]]]
+           (materialize-view-blocks (variable-features-row-views ds 1))))
     (is (= [[1 [1.0 2.0]] [2 [4.0 5.0 6.0]]]
            (materialize-view-blocks (variable-features-col-views ds :xs))))))
 
 (deftest scalar-layout-rejects-zero-copy-block-views
   (let [ds (scalar-features-compile [{:entity :a :vals (array-map :x 1.25)}])]
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                          #"Zero-copy block views require block payload storage"
-                          (scalar-features-block-view ds :a :x)))))
+    (doseq [query [#(scalar-features-block-view ds :a :x) #(scalar-features-row-views ds :a)
+                   #(scalar-features-col-views ds :x)]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"Zero-copy block views require block payload storage"
+                            (query))))
+    (is (= [] (scalar-features-row-views ds :missing)))
+    (is (= [] (scalar-features-col-views ds :missing)))))
 
 (defn- ingest-entries
   [layout entries]
@@ -271,3 +277,173 @@
                                                      (:payload-ptrs no-coo)))))
       (is (some? (:edge-rows keep-coo)))
       (is (some? (:edge-cols keep-coo))))))
+
+(deftest fixed-block-count-is-derived-from-payload-storage
+  (doseq [dim [1 3 17]]
+    (let [builder (sparse/make-builder {:payload {:kind :fixed-double-block :dim dim}})
+          buffer (.-payloadBuffer builder)]
+
+      (is (zero? (sparse/-payload-count buffer)))
+      (dotimes [i 40]
+        (sparse/append-entry! builder i :value (repeat dim (double i)))
+        (is (= (inc i) (sparse/-payload-count buffer))))
+      (let [frozen (sparse/freeze-builder! builder)]
+        (is (= (* 40 dim) (alength ^doubles (:payload-values frozen))))
+        (sparse/append-entry! builder 40 :value (repeat dim 40.0))
+        (is (= 41 (sparse/-payload-count buffer)))
+        (is (= (* 40 dim) (alength ^doubles (:payload-values frozen)))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (sparse/append-entry! builder :invalid :value (repeat (inc dim) 0.0))))
+      (is (= 41 (sparse/-payload-count buffer)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"COO coordinate and payload counts diverged"
+                            (sparse/freeze-builder! builder))))))
+
+(deftest csr-reuses-coalesced-columns-within-each-frozen-snapshot
+  (doseq [{:keys [layout entries]} comparison-cases]
+    (let [builder (ingest-entries (assoc layout :retain-coo? true) entries)
+          frozen (sparse/freeze-builder! builder)
+          columns (:csr-col-ids frozen)
+          snapshot (vec columns)]
+
+      (is (identical? (:edge-cols frozen) columns))
+      (let [[row col payload] (first entries)]
+        (sparse/append-entry! builder row col payload))
+      (let [next-frozen (sparse/freeze-builder! builder)]
+        (is (identical? (:edge-cols next-frozen) (:csr-col-ids next-frozen)))
+        (is (not (identical? columns (:csr-col-ids next-frozen))))
+        (is (= snapshot (vec columns)))))))
+
+(defn- query-result
+  [query ds args materialize]
+  (try (materialize (apply query ds args))
+       (catch clojure.lang.ExceptionInfo e [:error (ex-data e)])))
+
+(deftest generated-queries-match-protocol-methods-for-every-index-selection
+  (doseq [indices
+          [#{:csr :csc} #{:csr} #{:csc} #{}]
+
+          records
+          [[{:entity 1 :vals (array-map :f1 [1.0 2.0 3.0])}
+            {:entity 2 :vals (array-map :f2 [4.0 5.0 6.0])}] []]]
+
+    (let [builder (make-entity-features-builder {:indices indices :retain-coo? false})]
+      (doseq [record records]
+        (entity-features-ingest! builder record))
+      (let [ds (entity-features-freeze! builder)]
+        (doseq [[generated protocol materialize argument-lists]
+                [[entity-features-row-id row-id identity [[1] [:missing]]]
+                 [entity-features-col-id col-id identity [[:f1] [:missing]]]
+                 [entity-features-row row-blocks materialize-blocks [[1] [:missing]]]
+                 [entity-features-col col-blocks materialize-blocks [[:f1] [:missing]]]
+                 [entity-features-block block materialize-value [[1 :f1] [1 :f2] [:missing :f1]]]
+                 [entity-features-row-views row-block-views materialize-view-blocks
+                  [[1] [:missing]]]
+                 [entity-features-col-views col-block-views materialize-view-blocks
+                  [[:f1] [:missing]]]
+                 [entity-features-block-view block-view #(when % (materialize-view %))
+                  [[1 :f1] [1 :f2] [:missing :f1]]]]
+                args argument-lists]
+
+          (is (= (query-result protocol ds args materialize)
+                 (query-result generated ds args materialize))
+              (str "indices=" indices ", args=" args)))))))
+
+(deftest shared-traversal-preserves-copy-and-view-ownership
+  (let [ds
+        (entity-features-compile [{:entity 1 :vals (array-map :f1 [1.0 2.0 3.0])}])
+
+        values
+        (:payload-values (sparse/sparse-internals ds))]
+
+    (doseq [[copy-query view-query key] [[entity-features-row entity-features-row-views 1]
+                                         [entity-features-col entity-features-col-views :f1]]]
+      (let [copied (second (first (copy-query ds key)))
+            view (second (first (view-query ds key)))]
+
+        (is (not (identical? values copied)))
+        (is (identical? values (sparse/block-view-array view)))
+        (aset ^doubles copied 0 99.0)
+        (is (= [1.0 2.0 3.0] (materialize-view view)))))))
+
+(defn- direct-view-blocks
+  [values keys payload-ids]
+  (let [keys
+        ^objects keys
+
+        payload-ids
+        ^ints payload-ids]
+
+    (loop [i
+           0
+
+           out
+           (transient [])]
+
+      (if (= i (alength keys))
+        (persistent! out)
+        (recur (inc i)
+               (conj! out
+                      [(aget keys i)
+                       (sparse_layout.core.DoubleBlockView. ^doubles values
+                                                            (* 3 (long (aget payload-ids i)))
+                                                            3)]))))))
+
+(defn- allocated-bytes-per-call
+  [^com.sun.management.ThreadMXBean bean f]
+  (let [sink
+        (object-array 1)
+
+        thread-id
+        (.getId (Thread/currentThread))]
+
+    (dotimes [_ 20000]
+      (aset sink 0 (f)))
+    (apply min
+      (repeatedly 5
+                  (fn []
+                    (let [before (.getThreadAllocatedBytes bean thread-id)]
+                      (dotimes [_ 1000]
+                        (aset sink 0 (f)))
+                      (/ (- (.getThreadAllocatedBytes bean thread-id) before) 1000.0)))))))
+
+(deftest view-traversal-does-not-allocate-boxed-payload-ids
+  (let [bean (java.lang.management.ManagementFactory/getThreadMXBean)]
+    (when (and (instance? com.sun.management.ThreadMXBean bean)
+               (.isThreadAllocatedMemorySupported ^com.sun.management.ThreadMXBean bean))
+      (let [bean ^com.sun.management.ThreadMXBean bean
+            was-enabled (.isThreadAllocatedMemoryEnabled bean)]
+
+        (try (.setThreadAllocatedMemoryEnabled bean true)
+             (let [width 256
+                   block (double-array [1.0 2.0 3.0])
+                   columns (into (sorted-map) (map #(vector % block) (range width)))
+                   ds (entity-features-compile (mapv #(hash-map :entity % :vals columns)
+                                                     (range width)))
+                   {payload-values :payload-values id-to-row :id->row id-to-col :id->col}
+                   (sparse/sparse-internals ds)]
+
+               (doseq [[label copy-query view-query key keys payload-ids]
+                       [[:row entity-features-row entity-features-row-views 255 id-to-col
+                         (int-array (range (* 255 width) (* 256 width)))]
+                        [:column entity-features-col entity-features-col-views 0 id-to-row
+                         (int-array (map #(* width %) (range width)))]]]
+                 (testing (name label)
+                   ;; Exercise both materializers so a shared callback is not monomorphic.
+                   (allocated-bytes-per-call bean #(copy-query ds key))
+                   (let [reference #(direct-view-blocks payload-values keys payload-ids)
+                         query #(view-query ds key)
+                         expected (allocated-bytes-per-call bean reference)
+                         actual (allocated-bytes-per-call bean query)]
+
+                     (is (= (materialize-view-blocks (reference))
+                            (materialize-view-blocks (query))))
+                     ;; Allow fixed per-call overhead, but not one box per returned view.
+                     ;; Compare on this JVM rather than assuming an object/header size.
+                     (is (<= actual (+ expected 1024.0))
+                         (str "View traversal allocated "
+                              actual
+                              " bytes/call; direct construction "
+                              expected
+                              " bytes/call"))))))
+             (finally (.setThreadAllocatedMemoryEnabled bean was-enabled)))))))
