@@ -173,11 +173,11 @@
         structural
         (filterv :structural? compiled)
 
+        ;; Replay is row/column ordered, which is also base-entry order in CSR.
         replacements
         (->> compiled
              (remove :structural?)
              (mapcat :entries)
-             (sort-by :base-entry-id)
              vec)
 
         structural-count
@@ -472,74 +472,46 @@
 
       (if (or (= written limit) (and (= main-entry main-end) (= patch-idx patch-count)))
         written
-        (cond (= main-entry main-end)
-              (let [{:keys [op] :as entry} (nth entries patch-idx)]
-                (if (= :put op)
-                  (if (< position row-offset)
-                    (recur main-entry (inc patch-idx) (inc position) written)
-                    (do (write-patch! source
-                                      (.-rowId patch)
-                                      entry
-                                      dst-row-ids
-                                      dst-col-ids
-                                      dst-values
-                                      (+ dst-entry-off written))
-                        (recur main-entry (inc patch-idx) (inc position) (inc written))))
-                  (recur main-entry (inc patch-idx) position written)))
-              (= patch-idx patch-count)
-              (if (< position row-offset)
-                (recur (inc main-entry) patch-idx (inc position) written)
-                (do (write-main! source
-                                 (.-rowId patch)
-                                 main-entry
-                                 dst-row-ids
-                                 dst-col-ids
-                                 dst-values
-                                 (+ dst-entry-off written))
-                    (recur (inc main-entry) patch-idx (inc position) (inc written))))
-              :else
-              (let [main-col-id
-                    (p/csr-entry-col-id source main-entry)
+        (let [entry
+              (when (< patch-idx patch-count) (nth entries patch-idx))
 
-                    {:keys [op col-id] :as entry}
-                    (nth entries patch-idx)]
+              order
+              (long (cond (= main-entry main-end) 1
+                          (= patch-idx patch-count) -1
+                          :else (Long/compare (long (p/csr-entry-col-id source main-entry))
+                                              (long (:col-id entry)))))
 
-                (cond (< main-col-id col-id)
-                      (if (< position row-offset)
-                        (recur (inc main-entry) patch-idx (inc position) written)
-                        (do (write-main! source
-                                         (.-rowId patch)
-                                         main-entry
-                                         dst-row-ids
-                                         dst-col-ids
-                                         dst-values
-                                         (+ dst-entry-off written))
-                            (recur (inc main-entry) patch-idx (inc position) (inc written))))
-                      (> main-col-id col-id)
-                      (if (= :put op)
-                        (if (< position row-offset)
-                          (recur main-entry (inc patch-idx) (inc position) written)
-                          (do (write-patch! source
-                                            (.-rowId patch)
-                                            entry
-                                            dst-row-ids
-                                            dst-col-ids
-                                            dst-values
-                                            (+ dst-entry-off written))
-                              (recur main-entry (inc patch-idx) (inc position) (inc written))))
-                        (recur main-entry (inc patch-idx) position written))
-                      (= :put op)
-                      (if (< position row-offset)
-                        (recur (inc main-entry) (inc patch-idx) (inc position) written)
-                        (do (write-patch! source
-                                          (.-rowId patch)
-                                          entry
-                                          dst-row-ids
-                                          dst-col-ids
-                                          dst-values
-                                          (+ dst-entry-off written))
-                            (recur (inc main-entry) (inc patch-idx) (inc position) (inc written))))
-                      :else (recur (inc main-entry) (inc patch-idx) position written))))))))
+              patch?
+              (not (neg? order))
+
+              emit?
+              (or (not patch?) (= :put (:op entry)))
+
+              write?
+              (and emit? (>= position row-offset))]
+
+          ;; Equal coordinates advance both inputs; the patch decides whether
+          ;; that coordinate is emitted. Deletions do not consume output positions.
+          (when write?
+            (if patch?
+              (write-patch! source
+                            (.-rowId patch)
+                            entry
+                            dst-row-ids
+                            dst-col-ids
+                            dst-values
+                            (+ dst-entry-off written))
+              (write-main! source
+                           (.-rowId patch)
+                           main-entry
+                           dst-row-ids
+                           dst-col-ids
+                           dst-values
+                           (+ dst-entry-off written))))
+          (recur (if (<= order 0) (inc main-entry) main-entry)
+                 (if patch? (inc patch-idx) patch-idx)
+                 (if emit? (inc position) position)
+                 (if write? (inc written) written)))))))
 
 (defn copy-page!
   "Copies a bounded visible page from the base plus one compiled ledger cut."

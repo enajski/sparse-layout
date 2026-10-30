@@ -782,3 +782,117 @@
                            #"destination"
                            (overlay/copy-page! view 0 2 0 3 rows (int-array 1) (double-array 3) 0)))
                      (is (= [-1] (vec rows)))))))
+
+(deftest ledger-overlay-merges-row-boundaries-and-partial-pages
+  (with-artifact
+    (gapped-source)
+    (fn [_ mapped]
+      (doseq [{:keys [label row-id operations expected]}
+              [{:label "main entries before and after an insertion"
+                :row-id 2
+                :operations [[:put 1]]
+                :expected [[0 [3.0 4.0]] [1 [70.0 71.0]] [2 [5.0 6.0]]]}
+               {:label "patch exhausts before the main row"
+                :row-id 0
+                :operations [[:put 0]]
+                :expected [[0 [70.0 71.0]] [1 [1.0 2.0]]]}
+               {:label "main row exhausts before the patch"
+                :row-id 0
+                :operations [[:put 2]]
+                :expected [[1 [1.0 2.0]] [2 [70.0 71.0]]]}
+               {:label "replacement and deletion at existing coordinates"
+                :row-id 2
+                :operations [[:delete 0] [:put 1] [:put 2]]
+                :expected [[1 [70.0 71.0]] [2 [70.0 71.0]]]}
+               {:label "deletion followed by a remaining main entry"
+                :row-id 2
+                :operations [[:delete 0]]
+                :expected [[2 [5.0 6.0]]]}
+               {:label "insertion into an empty main row"
+                :row-id 1
+                :operations [[:put 0] [:put 2]]
+                :expected [[0 [70.0 71.0]] [2 [70.0 71.0]]]}
+               {:label "fully deleted row"
+                :row-id 2
+                :operations [[:delete 0] [:delete 2]]
+                :expected []}]]
+        (testing label
+          (let [ledger (map-indexed (fn [sequence-id [op col-id]]
+                                      {:sequence sequence-id
+                                       :op op
+                                       :row-id row-id
+                                       :col-id col-id
+                                       :block (double-array [70.0 71.0])})
+                                    operations)
+                view (overlay/compile-ledger mapped ledger)
+                entry-count (count expected)]
+
+            (is (= entry-count (overlay/range-entry-count view row-id (inc row-id))))
+            (doseq [cursor (range (inc entry-count))
+                    page-size [1 2 5]]
+
+              (let [copied (min page-size (- entry-count cursor))
+                    page (subvec expected cursor (+ cursor copied))
+                    rows (int-array (+ copied 2))
+                    cols (int-array (+ copied 2))
+                    values (double-array (* (+ copied 2) 2))]
+
+                (Arrays/fill rows -1)
+                (Arrays/fill cols -1)
+                (Arrays/fill values -1.0)
+                (is (= copied
+                       (overlay/copy-page! view
+                                           row-id
+                                           (inc row-id)
+                                           cursor
+                                           page-size
+                                           rows
+                                           cols
+                                           values
+                                           1)))
+                (is (= (vec (concat [-1] (repeat copied row-id) [-1])) (vec rows)))
+                (is (= (vec (concat [-1] (map first page) [-1])) (vec cols)))
+                (is (= (vec (concat [-1.0 -1.0] (mapcat second page) [-1.0 -1.0]))
+                       (vec values)))))))))))
+
+(deftest ledger-replacements-stay-in-base-entry-order
+  (with-artifact
+    (test-source)
+    (fn [_ mapped]
+      (let [coordinates
+            [[3 1] [0 1] [2 0] [0 0] [1 0]]
+
+            ledger
+            (map-indexed (fn [sequence-id [row-id col-id]]
+                           {:sequence sequence-id
+                            :op :put
+                            :row-id row-id
+                            :col-id col-id
+                            :block (double-array [sequence-id (+ sequence-id 10)
+                                                  (+ sequence-id 20)])})
+                         coordinates)
+
+            view
+            (overlay/compile-ledger mapped ledger)
+
+            rows
+            (int-array 5)
+
+            cols
+            (int-array 5)
+
+            values
+            (double-array 15)]
+
+        (is (= 0 (:structural-row-count (overlay/metadata view))))
+        (is (= 5 (:replacement-count (overlay/metadata view))))
+        (is (= 5 (overlay/copy-page! view 0 4 0 5 rows cols values 0)))
+        (is (= [0 0 1 2 3] (vec rows)))
+        (is (= [0 1 0 0 1] (vec cols)))
+        (is (= [3.0 13.0 23.0 1.0 11.0 21.0 4.0 14.0 24.0 2.0 12.0 22.0 0.0 10.0 20.0]
+               (vec values)))
+        (doseq [[sequence-id [row-id col-id]] (map-indexed vector coordinates)]
+          (let [point (double-array 3)]
+            (is (identical? point (overlay/copy-point! view row-id col-id point 0)))
+            (is (= (mapv double [sequence-id (+ sequence-id 10) (+ sequence-id 20)])
+                   (vec point)))))))))
