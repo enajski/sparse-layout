@@ -1,7 +1,10 @@
 {:paths ["src"]
  :aliases
- {:test {:extra-paths ["test"]
-         :main-opts ["-e" "(do (require 'clojure.test 'sparse-layout.core-test 'sparse-layout.facade-test 'sparse-layout.csr-source-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.core-test 'sparse-layout.facade-test 'sparse-layout.csr-source-test)] (when (pos? (+ fail error)) (System/exit 1))))"]}
+  {:build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.10"}
+                  slipset/deps-deploy {:mvn/version "0.2.2"}}
+           :ns-default build}
+   :test {:extra-paths ["test"]
+          :main-opts ["-e" "(do (require 'clojure.test 'sparse-layout.core-test 'sparse-layout.facade-test 'sparse-layout.csr-source-test 'sparse-layout.csr64-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.core-test 'sparse-layout.facade-test 'sparse-layout.csr-source-test 'sparse-layout.csr64-test)] (when (pos? (+ fail error)) (System/exit 1))))"]}
   :lint {:extra-deps {io.github.enajski/codestyle
                       {:git/url "https://github.com/enajski/codestyle.git"
                        :git/sha "658ee7f67a91dbe3f08c10b68d7c9f4107cb6a4f"}}
@@ -28,6 +31,22 @@
               :jvm-opts ["-XX:+UnlockExperimentalVMOptions"
                          "-XX:CompileCommand=blackhole,criterium.blackhole.Blackhole::consume"]
               :main-opts ["-m" "sparse-layout.construct"]}
+  :duckdb-compare {:extra-paths ["bench"]
+                   :extra-deps {net.mikera/vectorz-clj {:mvn/version "0.48.0"}
+                                io.github.yogthos/flatiron
+                                {:git/url "https://github.com/yogthos/flatiron.git"
+                                 :git/sha "fd27b76d6af097ab3211feffabda5d439ec6e4dd"}
+                                org.duckdb/duckdb_jdbc {:mvn/version "1.5.5.0"}}
+                   :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
+                   :main-opts ["-m" "sparse-layout.duckdb-compare"]}
+  :compare-test {:extra-paths ["test"]
+                 :main-opts ["-e" "(require 'sparse-layout.flatiron-compare-test 'sparse-layout.duckdb-compare-test) (let [{:keys [fail error]} (clojure.test/run-tests 'sparse-layout.flatiron-compare-test 'sparse-layout.duckdb-compare-test)] (when (pos? (+ fail error)) (System/exit 1)))"]}
+  :overlay-compare {:extra-paths ["bench"]
+                    :extra-deps {net.mikera/vectorz-clj {:mvn/version "0.48.0"}}
+                    :main-opts ["-m" "sparse-layout.overlay-compare"]}
+  :csr64-bench {:extra-paths ["bench"]
+                :jvm-opts ["-Xms1g" "-Xmx8g"]
+                :main-opts ["-m" "sparse-layout.csr64-bench"]}
   :memory {:extra-paths ["bench"]
            :extra-deps {com.clojure-goes-fast/clj-memory-meter {:mvn/version "0.4.0"}
                         net.mikera/vectorz-clj {:mvn/version "0.48.0"}}
