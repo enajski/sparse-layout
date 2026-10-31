@@ -2,6 +2,9 @@
 
 A small Clojure sparse layout compiler prototype.
 
+The [`0.1.1` candidate release notes](docs/release-0.1.1.md) include the Clojure
+performance changes and a fresh operation-by-operation comparison with `0.1.0`.
+
 `defsparse` turns a declarative nested-data shape into a mutable COO ingest builder and a frozen primitive-array-backed sparse datastore with CSR and/or CSC indexes.
 
 ```clojure
@@ -362,9 +365,9 @@ primitive `long` ids, so, unlike the five-argument arity, it does not box them.
 `load!` requests best-effort residency from the operating system, while
 `loaded?` exposes the corresponding point-in-time hint.
 
-Rows must contain strictly increasing, unique column IDs. The current opener
-checks column bounds but does not establish that ordering; malformed artifacts
-can produce incorrect point and overlay results. Write new generations to fresh,
+Rows must contain strictly increasing, unique column IDs. The opener validates
+both column bounds and strict ordering before exposing the source. Write new
+generations to fresh,
 unpublished paths: the writer truncates an existing target. Keep a generation
 alive across every page, with distinct row/column arrays owned by the caller.
 
@@ -417,10 +420,11 @@ strictly increasing sequence numbers:
 
 The latest record for a coordinate wins. Existing-value puts stay on a fast
 lane: CSR64 bulk-copies the base page, then patches destination blocks by base
-entry ID. Only rows containing an insert or effective delete use a sorted row
-merge. The compiled view owns copies of put blocks, is safe for concurrent
-readers, and requires its mapped base to remain open. Ledger durability and
-transaction boundaries remain the caller's responsibility.
+entry ID. Rows containing an insert or effective delete compile seekable
+clean/patch runs: arbitrary page cursors binary-search visible run ends, and clean
+spans retain CSR64 bulk copying. The compiled view owns copies of put blocks, is
+safe for concurrent readers, and requires its mapped base to remain open. Ledger
+durability and transaction boundaries remain the caller's responsibility.
 
 Run the medium, 295-double overlay benchmark with:
 

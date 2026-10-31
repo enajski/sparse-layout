@@ -1,6 +1,8 @@
 # CSR64 modification-ledger overlay
 
-The changes described below as recommendations are not implemented yet.
+This describes the `0.1.1` candidate. Structural seeking is implemented; the
+remaining recommendations are called out separately. See the
+[release comparison](release-0.1.1.md) for measurements against `0.1.0`.
 
 ## Decision
 
@@ -36,9 +38,8 @@ Each input record is a Clojure map:
 ```
 
 - Sequence numbers are non-negative and strictly increasing in replay order.
-- Records must be maps. **Known validation defect:** a `nil` or `false` record
-  currently terminates replay without rejecting or applying subsequent records
-  (review R4). The intended behavior is rejection of malformed input.
+- Records must be maps. A `nil` or `false` record is rejected by field validation,
+  rather than silently terminating replay (already fixed in `0.1.0`).
 - The latest record for a `(row-id, col-id)` coordinate wins.
 - Row and column IDs are numeric and must already belong to the base generation.
 - A put may create a previously absent coordinate inside those ID domains.
@@ -49,9 +50,9 @@ Each input record is a Clojure map:
 - Keep the same base and ledger cut throughout a paged read; a cursor belongs
   to that generation. Concurrent readers need separate destination arrays, and
   row/column destination arrays must be distinct.
-- Base rows must contain strictly increasing, unique column IDs. The current
-  CSR64 opener checks bounds but not that ordering. An unordered artifact can
-  make a replacement look like an insertion; see review finding R1.
+- Base rows must contain strictly increasing, unique column IDs. The CSR64 opener
+  validates bounds and ordering, rejecting unordered or duplicate columns
+  (already fixed in `0.1.0`).
 
 New logical row or column keys require the next base generation. The overlay
 does not introduce another dictionary or ID-allocation policy.
@@ -64,7 +65,7 @@ coordinate, sorts it by numeric row and column ID, and separates two paths:
 | Path | Contents | Query operation |
 |---|---|---|
 | value replacements | puts for coordinates already present in the base, sorted by base entry ID | bulk-copy the CSR64 range, then overwrite matching destination blocks |
-| structural rows | inserts and effective deletes, plus any replacements in the same row | two-finger merge that row's base columns with its sorted modifications |
+| structural rows | inserts and effective deletes, plus any replacements in the same row | seek compiled clean/patch runs and bulk-copy surviving base spans |
 
 The structural-row index also stores cumulative entry-count adjustments. A
 range count is therefore:
@@ -77,7 +78,11 @@ base entries in [row-start, row-end)
 
 Only structural rows are indexed by row. The overlay does not allocate a second
 `row-count + 1` pointer array, so its index size follows modified state rather
-than the potentially much larger base domain.
+than the potentially much larger base domain. Each structural row keeps sorted,
+exclusive visible run ends, row-local base offsets, and references to its owned
+put blocks. There are at most `2m + 1` runs for `m` effective modified coordinates
+in that row, not an entry-sized index for the whole base row. Insert positions are
+found by binary search during compilation; deletes contribute no visible run.
 
 ## Query execution
 
@@ -85,9 +90,8 @@ than the potentially much larger base domain.
 entry cursor, maximum entry count, caller-owned `int[]`/`double[]` destinations,
 and validation before the first write.
 
-The overlay returns `0` for empty or exhausted pages. The base currently returns
-`nil` in those cases (review R2), so this intended shared contract is not yet
-fully consistent.
+Both the overlay and base return `0` for empty or exhausted pages without writing
+to the destination (already fixed in `0.1.0`).
 
 1. Compute the visible range count from base pointers plus cumulative structural
    adjustments.
@@ -96,29 +100,31 @@ fully consistent.
 3. Bulk-copy every run that contains no structural row using CSR64
    `MemorySegment.copy`.
 4. Apply replacement blocks whose base entry IDs fall inside that copied run.
-5. Merge only structural rows, preserving ascending column ID order.
+5. Seek structural-row run ends, then copy only the intersecting clean/patch runs
+   in ascending column ID order.
 6. Stop at the requested page boundary and return the copied entry count.
 
 `copy-point!` checks the row patch first, then a replacement's base entry ID,
 then falls through to the mapped base.
 
-For `S` structural rows, `P` replacement entries, `D` selected structural rows,
-and `B` copied base bytes, the intended hot-path shape is:
+For `S` structural rows, `P` replacement entries, selected structural rows `D`,
+`R_r` compiled runs in row `r`, `T` touched runs, and `B` copied payload bytes,
+the hot-path shape is:
 
 ```text
 range count       O(log S)
 cursor location   O(log(row-count) × log S)
 clean page        O(B) bulk copy + O(log P + selected replacements)
-structural work   O(base entries in D + modifications in D)
+structural work   O(sum over r in D of log(1 + R_r) + T + B)
 ```
 
 These are per-call work shapes, not a page-size latency bound. The base row-ID
-fill walks intervening rows, including empty ones. More significantly, the
-current structural merge restarts at the beginning of its dirty row on every
-page and skips up to `row-offset` entries again. Draining one row of degree `d`
-in pages of `k` can therefore take Θ(d²/k) merge work. A review probe copied one
-entry at cursor 99,999 while performing 100,001 column reads. The uniform
-16-entry benchmark does not exercise this case.
+fill still walks intervening rows, including empty ones. Structural pages no
+longer rescan the skipped prefix: numeric cursors can move forward or backward
+without retained iterator state. The old review probe copied one entry at cursor
+99,999 while performing 100,001 column reads. The unit regression now bounds both
+scalar reads and the base entries requested through bulk copies. Compilation and
+run metadata are additional costs, measured in the [release comparison](release-0.1.1.md).
 
 Value-only overlays also still perform visible-prefix searches and allocate
 row-span vectors. Having no structural rows does not currently bypass that
@@ -215,17 +221,19 @@ tails and three-call warmup are diagnostics, not production p99 guarantees.
 
 The accompanying base-only probe used sustained warmup and three fresh JVMs;
 its full CSR64 page was within 2.5% of a raw payload-only copy. That leaves more
-useful optimisation work in the overlay:
+useful optimisation work in the overlay. The first priority, seekable clean/patch
+runs, is implemented in `0.1.1`, with independent exact-output and bounded-work
+regression checks. [Candidate measurements](release-0.1.1.md) cover early, middle,
+and late pages, bounded drains, dense rows, and warmed compilation costs. Remaining
+candidates are:
 
-1. Compile seekable clean/patch runs in structural rows, then bulk-copy surviving
-   base spans. Check early and late pages against skewed-row reference results.
-2. Bypass visible-prefix row search when there are no structural rows. Reuse the
+1. Bypass visible-prefix row search when there are no structural rows. Reuse the
    base cursor and apply value replacements directly.
-3. Compare compaction with packing replacement blocks in base-entry order and
+2. Compare compaction with packing replacement blocks in base-entry order and
    coalescing adjacent runs. At 100,000 replacements, 38.15% of the base entries
    are replaced and the blocks alone retain 236 MB. Copying the base and then
    overwriting adds 472 MB of logical read/write traffic per full drain.
-4. If profiles justify it, avoid a second base point search on replacement
+3. If profiles justify it, avoid a second base point search on replacement
    misses and use primitive prefix access instead of row-span vectors.
 
 Preserve defensive block copying. Copying only final winners during replay is

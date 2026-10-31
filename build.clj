@@ -4,7 +4,7 @@
             [deps-deploy.deps-deploy :as deploy]))
 
 (def lib 'io.github.enajski/sparse-layout)
-(def version "0.1.0")
+(def version "0.1.1")
 (def class-dir "target/classes")
 (def jar-file (str "target/sparse-layout-" version ".jar"))
 
