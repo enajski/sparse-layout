@@ -8,7 +8,8 @@
 
 (def ^:private double-array-class (class (double-array 0)))
 
-(deftype StructuralRowPatch [^long rowId entries ^long adjustment])
+(deftype StructuralRowPatch [^long rowId entries ^long adjustment ^longs runEnds ^longs baseOffsets
+                             ^objects runEntries])
 
 (deftype CSR64LedgerOverlay [base ^long throughSequence ^long ledgerRecordCount
                              ^long retainedModificationCount ^ints structuralRows
@@ -144,6 +145,105 @@
 
     {:entries entries :structural? structural? :adjustment adjustment}))
 
+(defn- insertion-position
+  ^long [source ^long start ^long end ^long col-id]
+  (loop [low
+         start
+
+         high
+         end]
+
+    (if (< low high)
+      (let [middle (+ low (quot (- high low) 2))]
+        (if (< (long (p/csr-entry-col-id source middle)) col-id)
+          (recur (inc middle) high)
+          (recur low middle)))
+      low)))
+
+(defn- compile-structural-row
+  [source row-id entries adjustment]
+  (let [[start end]
+        (p/csr-row-span source row-id)
+
+        start
+        (long start)
+
+        end
+        (long end)
+
+        ;; Store only surviving base spans and visible puts, never one record per
+        ;; untouched base entry. Exclusive visible ends make arbitrary cursors seekable.
+        runs
+        (loop [remaining
+               (seq entries)
+
+               base-entry
+               start
+
+               visible
+               (long 0)
+
+               runs
+               (transient [])]
+
+          (if remaining
+            (let [entry
+                  (first remaining)
+
+                  base-entry-id
+                  (long (:base-entry-id entry))
+
+                  position
+                  (long (if (neg? base-entry-id)
+                          (insertion-position source base-entry end (long (:col-id entry)))
+                          base-entry-id))
+
+                  clean-count
+                  (- position base-entry)
+
+                  clean-end
+                  (checked-add visible clean-count)
+
+                  runs
+                  (if (pos? clean-count) (conj! runs [clean-end (- base-entry start) nil]) runs)
+
+                  put?
+                  (= :put (:op entry))
+
+                  next-visible
+                  (if put? (checked-add clean-end 1) clean-end)
+
+                  runs
+                  (if put? (conj! runs [next-visible -1 entry]) runs)]
+
+              (recur (next remaining)
+                     (if (neg? base-entry-id) position (inc position))
+                     next-visible
+                     runs))
+            (persistent!
+              (if (< base-entry end)
+                (conj! runs [(checked-add visible (- end base-entry)) (- base-entry start) nil])
+                runs))))
+
+        run-count
+        (count runs)
+
+        run-ends
+        (long-array run-count)
+
+        base-offsets
+        (long-array run-count)
+
+        run-entries
+        (object-array run-count)]
+
+    (dotimes [idx run-count]
+      (let [[visible-end base-offset entry] (nth runs idx)]
+        (aset run-ends idx (long visible-end))
+        (aset base-offsets idx (long base-offset))
+        (aset run-entries idx entry)))
+    (->StructuralRowPatch row-id entries adjustment run-ends base-offsets run-entries)))
+
 (defn compile-ledger
   "Compiles ordered numeric ledger records into an immutable CSR64 overlay.
 
@@ -207,7 +307,7 @@
     (dotimes [idx structural-count]
       (let [{:keys [row-id entries adjustment]} (nth structural idx)]
         (aset structural-rows idx (int row-id))
-        (aset structural-patches idx (->StructuralRowPatch row-id entries adjustment))
+        (aset structural-patches idx (compile-structural-row source row-id entries adjustment))
         (aset adjustments (inc idx) (+ (aget adjustments idx) (long adjustment)))))
     (dotimes [idx replacement-count]
       (let [{:keys [base-entry-id block]} (nth replacements idx)]
@@ -406,21 +506,6 @@
           (recur (inc idx))))))
   nil)
 
-(defn- write-main!
-  [source row-id entry-id ^ints dst-row-ids ^ints dst-col-ids ^doubles dst-values dst-entry-off]
-  (let [row-id
-        (long row-id)
-
-        entry-id
-        (long entry-id)
-
-        dst-entry-off
-        (long dst-entry-off)]
-
-    (aset dst-row-ids (int dst-entry-off) (int row-id))
-    (aset dst-col-ids (int dst-entry-off) (int (p/csr-entry-col-id source entry-id)))
-    (p/csr-copy-block! source entry-id dst-values (* dst-entry-off (p/csr-block-dim source)))))
-
 (defn- write-patch!
   [source row-id entry ^ints dst-row-ids ^ints dst-col-ids ^doubles dst-values dst-entry-off]
   (let [row-id
@@ -449,69 +534,57 @@
         dst-entry-off
         (long dst-entry-off)
 
-        [main-start main-end]
-        (p/csr-row-span source (.-rowId patch))
+        row-id
+        (.-rowId patch)
 
-        entries
-        (.-entries patch)
+        run-ends
+        ^longs (.-runEnds patch)
 
-        patch-count
-        (count entries)]
+        base-offsets
+        ^longs (.-baseOffsets patch)
 
-    (loop [main-entry
-           (long main-start)
+        run-entries
+        ^objects (.-runEntries patch)]
 
-           patch-idx
-           (long 0)
+    (loop [idx
+           (lower-bound-long run-ends (inc row-offset))
 
            position
-           (long 0)
+           row-offset
 
            written
            (long 0)]
 
-      (if (or (= written limit) (and (= main-entry main-end) (= patch-idx patch-count)))
+      (if (= written limit)
         written
-        (let [entry
-              (when (< patch-idx patch-count) (nth entries patch-idx))
+        (let [run-end
+              (aget run-ends (int idx))
 
-              order
-              (long (cond (= main-entry main-end) 1
-                          (= patch-idx patch-count) -1
-                          :else (Long/compare (long (p/csr-entry-col-id source main-entry))
-                                              (long (:col-id entry)))))
+              run-start
+              (if (zero? idx) 0 (aget run-ends (int (dec idx))))
 
-              patch?
-              (not (neg? order))
+              requested
+              (long (min (- limit written) (- run-end position)))
 
-              emit?
-              (or (not patch?) (= :put (:op entry)))
+              entry
+              (aget run-entries (int idx))
 
-              write?
-              (and emit? (>= position row-offset))]
+              out
+              (+ dst-entry-off written)]
 
-          ;; Equal coordinates advance both inputs; the patch decides whether
-          ;; that coordinate is emitted. Deletions do not consume output positions.
-          (when write?
-            (if patch?
-              (write-patch! source
-                            (.-rowId patch)
-                            entry
-                            dst-row-ids
-                            dst-col-ids
-                            dst-values
-                            (+ dst-entry-off written))
-              (write-main! source
-                           (.-rowId patch)
-                           main-entry
-                           dst-row-ids
-                           dst-col-ids
-                           dst-values
-                           (+ dst-entry-off written))))
-          (recur (if (<= order 0) (inc main-entry) main-entry)
-                 (if patch? (inc patch-idx) patch-idx)
-                 (if emit? (inc position) position)
-                 (if write? (inc written) written)))))))
+          (if entry
+            (write-patch! source row-id entry dst-row-ids dst-col-ids dst-values out)
+            ;; Delegate whole surviving spans to the checked mapped bulk-copy path.
+            (csr64/copy-page! source
+                              row-id
+                              (inc row-id)
+                              (+ (aget base-offsets (int idx)) (- position run-start))
+                              requested
+                              dst-row-ids
+                              dst-col-ids
+                              dst-values
+                              out))
+          (recur (inc idx) (+ position requested) (+ written requested)))))))
 
 (defn copy-page!
   "Copies a bounded visible page from the base plus one compiled ledger cut."

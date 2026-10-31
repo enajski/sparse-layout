@@ -6,7 +6,7 @@
             [sparse-layout.csr64-overlay :as overlay])
   (:import [java.nio ByteBuffer ByteOrder]
            [java.nio.file Files Path]
-           [java.util Arrays]))
+           [java.util Arrays Random]))
 
 (defsparse csr64-features
            {:row-key [:row]
@@ -896,3 +896,169 @@
             (is (identical? point (overlay/copy-point! view row-id col-id point 0)))
             (is (= (mapv double [sequence-id (+ sequence-id 10) (+ sequence-id 20)])
                    (vec point)))))))))
+
+
+(defn- overlay-model-source
+  [rows col-count dim]
+  (let [entries (vec (mapcat seq rows))]
+    (csr/->HeapCSRSource {}
+                         (object-array (range (count rows)))
+                         {}
+                         (object-array (range col-count))
+                         (int-array (reductions + 0 (map count rows)))
+                         (int-array (map first entries))
+                         (double-array (mapcat second entries))
+                         dim
+                         nil
+                         nil)))
+
+(defn- overlay-value-bits [values] (mapv #(Double/doubleToRawLongBits (double %)) values))
+
+(deftest structural-pages-match-independent-randomized-ledger-model
+  (doseq [seed (range 12)]
+    (testing (str "seed=" seed)
+      (let [random (Random. seed)
+            row-count 6
+            col-count 18
+            dim 3
+            base (mapv (fn [row]
+                         (into (sorted-map)
+                               (for [col (range col-count)
+                                     :when (and (not= row 1)
+                                                (< (.nextInt random 4) (if (zero? row) 3 1)))]
+
+                                 [col [(double row) (double col) (+ row col 0.25)]])))
+                       (range row-count))
+            records (mapv (fn [sequence-id]
+                            (let [row (.nextInt random row-count)
+                                  col (.nextInt random col-count)]
+
+                              {:sequence sequence-id
+                               :row-id row
+                               :col-id col
+                               :op (if (zero? (.nextInt random 3)) :delete :put)
+                               :block (double-array (if (zero? (mod sequence-id 17))
+                                                      [Double/NaN Double/POSITIVE_INFINITY -0.0]
+                                                      [sequence-id (- sequence-id)
+                                                       (+ row col 0.5)]))}))
+                          (range 80))
+            visible (reduce (fn [rows {:keys [op row-id col-id block]}]
+                              (if (= :delete op)
+                                (update rows row-id dissoc col-id)
+                                (update rows row-id assoc col-id (vec block))))
+                            base
+                            records)]
+
+        (with-artifact
+          (overlay-model-source base col-count dim)
+          (fn [_ mapped]
+            (let [view (overlay/compile-ledger mapped records)]
+              (doseq [[start end] [[0 row-count] [0 1] [1 4] [3 row-count] [2 2]]]
+                (let [expected (vec (for [row (range start end)
+                                          [col block] (nth visible row)]
+
+                                      [[row col] block]))
+                      n (count expected)
+                      cursors (distinct (concat [0 n (quot n 2) (max 0 (dec n))]
+                                                (repeatedly 4 #(.nextInt random (inc n)))))]
+
+                  (is (= n (overlay/range-entry-count view start end)) (str "range=" [start end]))
+                  (doseq [cursor cursors
+                          page-size [1 3 11]]
+
+                    (testing (str "range=" [start end] ", cursor=" cursor ", page-size=" page-size)
+                      (let [copied (min page-size (- n cursor))
+                            page (subvec expected cursor (+ cursor copied))
+                            rows (int-array (+ copied 4) -777)
+                            cols (int-array (+ copied 4) -777)
+                            values (double-array (* (+ copied 4) dim) -777.0)]
+
+                        (is (= copied
+                               (overlay/copy-page! view
+                                                   start
+                                                   end
+                                                   cursor
+                                                   page-size
+                                                   rows
+                                                   cols
+                                                   values
+                                                   2)))
+                        (is (= (vec (concat [-777 -777] (map (comp first first) page) [-777 -777]))
+                               (vec rows)))
+                        (is (= (vec (concat [-777 -777] (map (comp second first) page) [-777 -777]))
+                               (vec cols)))
+                        (is (= (overlay-value-bits (concat (repeat (* 2 dim) -777.0)
+                                                           (mapcat second page)
+                                                           (repeat (* 2 dim) -777.0)))
+                               (overlay-value-bits values))))))))
+              (doseq [row (range row-count)
+                      col (range col-count)]
+
+                (testing (str "point=" [row col])
+                  (let [block (get-in visible [row col])
+                        dst (double-array 5 -777.0)
+                        result (overlay/copy-point! view row col dst 1)]
+
+                    (is (if block (identical? dst result) (nil? result)))
+                    (is (= (overlay-value-bits
+                             (if block (concat [-777.0] block [-777.0]) (repeat 5 -777.0)))
+                           (overlay-value-bits dst)))))))))))))
+
+(deftest structural-pages-seek-without-reading-the-skipped-prefix
+  (let [degree
+        8192
+
+        row
+        (into (sorted-map)
+              (map (fn [col]
+                     [col [(double col) (+ col 0.25) (+ col 0.5)]])
+                   (range degree)))]
+
+    (with-artifact
+      (overlay-model-source [row] (inc degree) 3)
+      (fn [_ mapped]
+        (let [calls
+              (atom 0)
+
+              copied-base-entries
+              (atom 0)
+
+              original-page
+              @(var csr64/copy-page!)
+
+              original
+              @(var csr64/entry-col)]
+
+          (with-redefs-fn
+            {(var csr64/entry-col) (fn ^long [columns ^long entry-id]
+                                     (swap! calls inc)
+                                     (long (original columns entry-id)))
+             (var csr64/copy-page!)
+             (fn [source start end cursor max-entries rows cols values offset]
+               (swap! copied-base-entries + (long max-entries))
+               (original-page source start end cursor max-entries rows cols values offset))}
+            (fn []
+              (let [view (overlay/compile-ledger mapped
+                                                 [{:sequence 0
+                                                   :op :put
+                                                   :row-id 0
+                                                   :col-id degree
+                                                   :block (double-array [-10.0 -20.0 -30.0])}])]
+                ;; Compiling one insertion must not scan the whole wide base row either.
+                (is (<= @calls 64) (str "Compilation column reads: " @calls))
+                (reset! calls 0)
+                ;; Deliberately nonsequential cursors: a page must not depend on prior reads.
+                (doseq [cursor [(dec degree) 0 (quot degree 2) degree]]
+                  (let [rows (int-array 3 -1)
+                        cols (int-array 3 -1)
+                        values (double-array 9 -1.0)
+                        block (if (= cursor degree) [-10.0 -20.0 -30.0] (get row cursor))]
+
+                    (is (= 1 (overlay/copy-page! view 0 1 cursor 1 rows cols values 1)))
+                    (is (= [-1 0 -1] (vec rows)))
+                    (is (= [-1 cursor -1] (vec cols)))
+                    (is (= (vec (concat [-1.0 -1.0 -1.0] block [-1.0 -1.0 -1.0])) (vec values)))))
+                (is (<= @calls 64) (str "Page column reads: " @calls))
+                (is (<= @copied-base-entries 3)
+                    (str "Base entries requested for three one-entry base pages: "
+                         @copied-base-entries))))))))))
